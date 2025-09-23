@@ -1,291 +1,191 @@
 # -*- coding: utf-8 -*-
 """
-DeepFloorplan2 - net.py
-- *_multi.png（索引 or RGB→索引）に対応
-- 任意構成/フラット配置データを再帰探索して <ID> と <ID>_multi.png をペアリング
-- TF2/Keras の軽量U-Netを内蔵（必要に応じて build_model を差し替えてOK）
+TF2/Keras3 版 DeepFloorplan 互換ネットワーク
+- zlzeng/DeepFloorplan の net.py と同等の役割・命名に寄せたクラス設計
+- 2ヘッド出力:
+    * logits_cw:   壁+開口（close_wall）などの境界系 (C_cw=2 を想定: 非境界/境界)
+    * logits_r:    部屋タイプ (C_r=num_room_classes)
+- build()/compile() 相当の役割は Network.build() で実施
+- forward() 相当は call()
 """
 
-import os, random
-from pathlib import Path
-import numpy as np
+from __future__ import annotations
+
+import os
+from typing import Tuple, Optional, Dict
 
 import tensorflow as tf
-from tensorflow import keras
-from tensorflow.keras import layers
+from tensorflow.keras import layers as L
+from tensorflow.keras import Model
 
-# ========== 乱数固定 ==========
-def set_global_seed(seed: int = 42):
-    random.seed(seed)
-    np.random.seed(seed)
-    tf.random.set_seed(seed)
 
-# ========== I/O ==========
-def read_image(path, target_size):
-    import cv2
-    p = Path(path)
-    img = cv2.imread(str(p), cv2.IMREAD_COLOR)
-    if img is None:
-        raise FileNotFoundError(f"failed to read image: {p}")
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    if target_size is not None:
-        h, w = target_size
-        img = cv2.resize(img, (w, h), interpolation=cv2.INTER_LINEAR)
-    img = img.astype(np.float32) / 255.0
-    return img
+def _conv_bn_relu(x, filters, k=3, s=1, d=1):
+    x = L.Conv2D(filters, k, strides=s, padding="same", dilation_rate=d, use_bias=False)(x)
+    x = L.BatchNormalization()(x)
+    return L.ReLU()(x)
 
-def _rgb_to_index(rgb_mask):
-    """
-    RGBマスク → ユニーク色インデックス化
-    *安全策*: 本来は全データで同一定義の索引マスクを用意するのがベスト
-    """
-    if rgb_mask.ndim == 2:
-        return rgb_mask
-    h, w, c = rgb_mask.shape
-    assert c == 3, "mask RGB expected"
-    flat = rgb_mask.reshape(-1, 3)
-    colors, inv = np.unique(flat, axis=0, return_inverse=True)
-    idx = inv.reshape(h, w).astype(np.int32)
-    return idx
-
-def read_mask(path, target_size, num_classes=None):
-    import cv2
-    p = Path(path)
-    m = cv2.imread(str(p), cv2.IMREAD_UNCHANGED)
-    if m is None:
-        raise FileNotFoundError(f"failed to read mask: {p}")
-    if m.ndim == 3:
-        m = cv2.cvtColor(m, cv2.COLOR_BGR2RGB)
-        m = _rgb_to_index(m)
-    if target_size is not None:
-        h, w = target_size
-        m = cv2.resize(m, (w, h), interpolation=cv2.INTER_NEAREST)
-    m = m.astype(np.int32)
-    if num_classes is not None:
-        m = np.clip(m, 0, num_classes - 1)
-    return m
-
-# ========== データ探索 ==========
-_IMG_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
-
-def _rglob_files(root: Path, exts):
-    return [p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in exts]
-
-def pair_image_mask_lists_generic(root: Path, mask_suffix: str = "_multi.png"):
-    """
-    再帰的に画像と <stem> + mask_suffix を探索し、(image, mask) のリストを返す
-    """
-    root = Path(root)
-    img_files = _rglob_files(root, _IMG_EXTS)
-
-    # マスク候補を stem -> [paths] で引けるように用意
-    mask_map = {}
-    for p in root.rglob(f"*{mask_suffix}"):
-        if p.is_file():
-            # stem から suffix を除いた基底名を推定
-            stem = p.stem
-            if stem.endswith(mask_suffix.replace(".png", "")):
-                stem = stem[: -len(mask_suffix.replace(".png", ""))]
-            mask_map.setdefault(stem, []).append(p)
-
-    pairs = []
-    for ip in sorted(img_files):
-        stem = ip.stem
-        cands = mask_map.get(stem, [])
-        if not cands:
-            local = list(ip.parent.glob(f"{stem}{mask_suffix}"))
-            if local:
-                cands = local
-        if cands:
-            cands_sorted = sorted(cands, key=lambda p: len(os.path.relpath(str(p), start=str(ip.parent))))
-            pairs.append((str(ip), str(cands_sorted[0])))
-    return pairs
-
-def _has_yolo_layout(root: Path):
-    return (root / "train" / "images").exists() and (root / "train" / "labels").exists()
-
-def _pair_yolo_like(root: Path, mask_suffix: str):
-    tr = (root / "train" / "images", root / "train" / "labels")
-    va = (root / "val" / "images", root / "val" / "labels")
-    def pair_in(img_dir, lab_dir):
-        img_paths = sorted([p for p in Path(img_dir).glob("*.*") if p.suffix.lower() in _IMG_EXTS])
-        pairs = []
-        for ip in img_paths:
-            mp = Path(lab_dir) / f"{ip.stem}{mask_suffix}"
-            if mp.exists():
-                pairs.append((str(ip), str(mp)))
-        return pairs
-    train_pairs = pair_in(*tr)
-    val_pairs = pair_in(*va) if (root / "val").exists() else []
-    return train_pairs, val_pairs
-
-def discover_pairs_and_splits(data_root: str, mask_suffix: str = "_multi.png",
-                              val_ratio: float = 0.1, split_only: bool = False):
-    """
-    data_root が YOLOライクならそれを採用。そうでない場合は再帰探索でペア集合を作る。
-    val がなければ val_ratio で分割。split_only=True なら既存構成を尊重（分割しない）。
-    """
-    root = Path(data_root)
-    if not root.exists():
-        raise FileNotFoundError(f"data_root not found: {root}")
-
-    if _has_yolo_layout(root):
-        train_pairs, val_pairs = _pair_yolo_like(root, mask_suffix)
-        if not train_pairs:
-            raise RuntimeError(f"No train pairs found under YOLO-like layout: {root}")
-        if not val_pairs and not split_only:
-            n = len(train_pairs)
-            k = max(1, int(n * val_ratio))
-            val_pairs = train_pairs[:k]
-            train_pairs = train_pairs[k:]
-            print(f"[Info] YOLO-like but no val -> split: train={len(train_pairs)} val={len(val_pairs)}")
-        else:
-            print(f"[Info] YOLO-like discovered: train={len(train_pairs)} val={len(val_pairs)}")
-        return train_pairs, val_pairs
-
-    all_pairs = pair_image_mask_lists_generic(root, mask_suffix=mask_suffix)
-    if not all_pairs:
-        raise RuntimeError(f"No (image, mask) pairs found in: {root} with suffix={mask_suffix}")
-
-    train_hint = (root / "train").exists()
-    val_hint   = (root / "val").exists()
-
-    if train_hint or val_hint:
-        train_pairs = [(ip, mp) for ip, mp in all_pairs if "/train/" in Path(ip).as_posix()]
-        val_pairs   = [(ip, mp) for ip, mp in all_pairs if "/val/"   in Path(ip).as_posix()]
-        if not val_pairs and not split_only:
-            base = train_pairs if train_pairs else all_pairs
-            n = len(base)
-            k = max(1, int(n * val_ratio))
-            val_pairs = base[:k]
-            train_pairs = base[k:]
-            print(f"[Info] flat train/val hint -> split: train={len(train_pairs)} val={len(val_pairs)}")
-        else:
-            print(f"[Info] flat hint discovered: train={len(train_pairs)} val={len(val_pairs)}")
-        return train_pairs, val_pairs
-
-    # 完全フラット（train/val すら無い）
-    if split_only:
-        print(f"[Info] split_only: returning all as train, none as val (flat dataset)")
-        return all_pairs, []
-    n = len(all_pairs)
-    k = max(1, int(n * val_ratio))
-    val_pairs = all_pairs[:k]
-    train_pairs = all_pairs[k:]
-    print(f"[Info] flat split -> train={len(train_pairs)} val={len(val_pairs)}  (total={n})")
-    return train_pairs, val_pairs
-
-# ========== tf.data ==========
-def make_tf_dataset(pairs, img_size, num_classes, batch_size, shuffle, aug=False):
-    H, W = img_size
-
-    def _load(ip, mp):
-        ip = ip.decode("utf-8")
-        mp = mp.decode("utf-8")
-        img = read_image(ip, (H, W))
-        msk = read_mask(mp, (H, W), num_classes)
-        return img, msk
-
-    def _tf_map(ip, mp):
-        img, msk = tf.numpy_function(_load, [ip, mp], [tf.float32, tf.int32])
-        img.set_shape([H, W, 3])
-        msk.set_shape([H, W])
-        if aug:
-            # 幾何を壊しにくい簡易Aug
-            if tf.random.uniform([]) > 0.5:
-                img = tf.image.flip_left_right(img)
-                msk = tf.image.flip_left_right(msk[..., None])[..., 0]
-            if tf.random.uniform([]) > 0.5:
-                img = tf.image.flip_up_down(img)
-                msk = tf.image.flip_up_down(msk[..., None])[..., 0]
-        return img, msk
-
-    ips = [p[0] for p in pairs]
-    mps = [p[1] for p in pairs]
-    ds = tf.data.Dataset.from_tensor_slices((ips, mps))
-    if shuffle:
-        ds = ds.shuffle(len(pairs), reshuffle_each_iteration=True)
-    ds = ds.map(_tf_map, num_parallel_calls=tf.data.AUTOTUNE)
-    ds = ds.batch(batch_size, drop_remainder=False).prefetch(tf.data.AUTOTUNE)
-    return ds
-
-# ========== モデル ==========
-def _conv_block(x, filters):
-    x = layers.Conv2D(filters, 3, padding="same")(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.ReLU()(x)
-    x = layers.Conv2D(filters, 3, padding="same")(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.ReLU()(x)
-    return x
+def _res_block(x, filters, k=3, d=1):
+    h = _conv_bn_relu(x, filters, k, 1, d)
+    h = L.Conv2D(filters, k, padding="same", dilation_rate=d, use_bias=False)(h)
+    h = L.BatchNormalization()(h)
+    if x.shape[-1] != filters:
+        x = L.Conv2D(filters, 1, padding="same", use_bias=False)(x)
+        x = L.BatchNormalization()(x)
+    h = L.Add()([h, x])
+    return L.ReLU()(h)
 
 def _down(x, filters):
-    c = _conv_block(x, filters)
-    p = layers.MaxPool2D()(c)
-    return c, p
+    x = L.MaxPool2D(2)(x)
+    return _res_block(x, filters)
 
 def _up(x, skip, filters):
-    x = layers.Conv2DTranspose(filters, 2, strides=2, padding="same")(x)
-    x = layers.Concatenate()([x, skip])
-    x = _conv_block(x, filters)
-    return x
+    x = L.UpSampling2D(size=2, interpolation="bilinear")(x)
+    x = L.Concatenate()([x, skip])
+    return _res_block(x, filters)
 
-def build_model(input_shape, num_classes):
-    """
-    既定: 軽量U-Net
-    - ここを既存バックボーンや別モデルに差し替えてもOK
-    """
-    inputs = layers.Input(shape=input_shape)
-    c1, p1 = _down(inputs, 32)
-    c2, p2 = _down(p1, 64)
-    c3, p3 = _down(p2, 128)
-    c4, p4 = _down(p3, 256)
-    bn = _conv_block(p4, 512)
 
-    u1 = _up(bn, c4, 256)
-    u2 = _up(u1, c3, 128)
-    u3 = _up(u2, c2, 64)
-    u4 = _up(u3, c1, 32)
-
-    logits = layers.Conv2D(num_classes, 1, padding="same", name="logits")(u4)  # from_logits=True
-    model = keras.Model(inputs, logits, name="UNetLite")
-    return model
-
-# ========== メトリクス ==========
-class MeanIoU(tf.keras.metrics.Metric):
+class Network(Model):
     """
-    Keras MeanIoU を logits + sparse label で扱うラッパ
-    * シリアライズ対応のため get_config / from_config を実装
+    Keras Model として実装。zlzeng/DeepFloorplan のインターフェイスに寄せたシンプルラッパ。
+    Attributes:
+        num_room_classes: 部屋クラス数（r ヘッド）
+        num_cw_classes:   近接壁/境界クラス数（cw ヘッド。既定=2）
+    Methods:
+        build(inputs_shape): 入力形状でモデルグラフを構築
+        call(x, training=False): 前向き
+        losses_dict(y_true_cw, y_true_r, y_pred_cw, y_pred_r): タスク別 loss を計算
     """
-    def __init__(self, num_classes, name="mean_iou", **kwargs):
+
+    def __init__(self,
+                 num_room_classes: int,
+                 num_cw_classes: int = 2,
+                 base_channels: int = 64,
+                 name: str = "DeepFloorplanMTL",
+                 **kwargs):
         super().__init__(name=name, **kwargs)
-        self.num_classes = int(num_classes)
-        self.miou = tf.keras.metrics.MeanIoU(num_classes=self.num_classes)
+        self.num_room_classes = num_room_classes
+        self.num_cw_classes = num_cw_classes
 
-    def update_state(self, y_true, y_pred, sample_weight=None):
-        y_pred = tf.argmax(y_pred, axis=-1, output_type=tf.int32)
-        self.miou.update_state(y_true, y_pred, sample_weight)
+        # Encoder
+        self.stem1 = L.Conv2D(base_channels, 7, strides=2, padding="same", use_bias=False)
+        self.stem1_bn = L.BatchNormalization()
+        self.stem1_act = L.ReLU()
 
-    def result(self):
-        return self.miou.result()
+        self.enc1 = _res_block  # 1/2
+        self.enc2 = _down       # 1/4
+        self.enc3 = _down       # 1/8
+        self.enc4 = _down       # 1/16
 
-    def reset_state(self):
-        self.miou.reset_state()
+        # Bottleneck with RBGA っぽい拡張畳み込み（簡易版）
+        self.bottleneck1 = lambda x: _res_block(x, base_channels * 8, d=2)
+        self.bottleneck2 = lambda x: _res_block(x, base_channels * 8, d=4)
 
-    # --- ここからシリアライズ対応 ---
-    def get_config(self):
-        base = super().get_config()
-        base.update({"num_classes": self.num_classes})
-        return base
+        # Decoder (UNet)
+        self.dec3_conv = None  # 後で dynamic build
+        self.dec2_conv = None
+        self.dec1_conv = None
+        self.dec0_conv = None
 
-    @classmethod
-    def from_config(cls, config):
-        num_classes = config.pop("num_classes")
-        return cls(num_classes=num_classes, **config)
+        # Heads
+        self.head_cw = None
+        self.head_r = None
 
-# ========== 可視化補助 ==========
-def colorize_index_mask(index_mask, num_classes):
-    import matplotlib
-    cmap = matplotlib.cm.get_cmap("tab20", num_classes)
-    rgb = (cmap(index_mask)[..., :3] * 255).astype(np.uint8)
-    return rgb
+        # 事前構築されるまでのプレースホルダ
+        self._built = False
+        self.input_spec = None
+
+    def build(self, input_shape):
+        """Keras の build: 入力 shape を受け取り，層を確定"""
+        _, H, W, C = input_shape
+        ch = 64
+
+        # ダミーで一度 forward してスキップ接続サイズを確定
+        xin = L.Input(shape=(H, W, C))
+        x0 = self.stem1_act(self.stem1_bn(self.stem1(xin)))  # 1/2
+        s1 = self.enc1(x0, ch)                               # 1/2
+        s2 = self.enc2(s1, ch * 2)                           # 1/4
+        s3 = self.enc3(s2, ch * 4)                           # 1/8
+        s4 = self.enc4(s3, ch * 8)                           # 1/16
+
+        b = self.bottleneck1(s4)
+        b = self.bottleneck2(b)
+
+        d3 = _up(b, s3, ch * 4)  # 1/8
+        d2 = _up(d3, s2, ch * 2) # 1/4
+        d1 = _up(d2, s1, ch)     # 1/2
+        d0 = L.UpSampling2D(size=2, interpolation="bilinear")(d1)  # 1/1
+
+        # 軽い整形 conv
+        self.dec3_conv = L.Conv2D(ch * 4, 3, padding="same", activation="relu")
+        self.dec2_conv = L.Conv2D(ch * 2, 3, padding="same", activation="relu")
+        self.dec1_conv = L.Conv2D(ch, 3, padding="same", activation="relu")
+        self.dec0_conv = L.Conv2D(ch, 3, padding="same", activation="relu")
+
+        # heads
+        self.head_cw = L.Conv2D(self.num_cw_classes, 1, name="logits_cw")   # [B,H,W,C_cw]
+        self.head_r  = L.Conv2D(self.num_room_classes, 1, name="logits_r")  # [B,H,W,C_r]
+
+        # mark built
+        super().build(input_shape)
+        self._built = True
+
+    def call(self, x, training=False):
+        # Encoder
+        x0 = self.stem1_act(self.stem1_bn(self.stem1(x), training=training), training=training)
+        s1 = self.enc1(x0, 64)
+        s2 = self.enc2(s1, 128)
+        s3 = self.enc3(s2, 256)
+        s4 = self.enc4(s3, 512)
+
+        # Bottleneck
+        b = self.bottleneck1(s4)
+        b = self.bottleneck2(b)
+
+        # Decoder
+        d3 = _up(b, s3, 256)
+        d3 = self.dec3_conv(d3)
+        d2 = _up(d3, s2, 128)
+        d2 = self.dec2_conv(d2)
+        d1 = _up(d2, s1, 64)
+        d1 = self.dec1_conv(d1)
+        d0 = L.UpSampling2D(size=2, interpolation="bilinear")(d1)
+        d0 = self.dec0_conv(d0)
+
+        # Heads (logits)
+        logits_cw = self.head_cw(d0)
+        logits_r  = self.head_r(d0)
+        return logits_cw, logits_r
+
+    @staticmethod
+    def losses_dict(y_true_cw, y_true_r, y_pred_cw, y_pred_r,
+                    cw_weight: float = 1.0, r_weight: float = 1.0) -> Dict[str, tf.Tensor]:
+        """
+        タスク別 softmax CE の合計（Cross-and-within の重み付けの簡易版）
+        y_* 形状: [B,H,W]（int32 ラベル） / y_pred_*: [B,H,W,C]
+        """
+        y_true_cw = tf.cast(y_true_cw, tf.int32)
+        y_true_r  = tf.cast(y_true_r, tf.int32)
+
+        loss_cw = tf.keras.losses.sparse_categorical_crossentropy(
+            y_true_cw, y_pred_cw, from_logits=True)
+        loss_r  = tf.keras.losses.sparse_categorical_crossentropy(
+            y_true_r, y_pred_r, from_logits=True)
+
+        loss_cw = tf.reduce_mean(loss_cw)
+        loss_r  = tf.reduce_mean(loss_r)
+
+        return {
+            "loss_cw": loss_cw * cw_weight,
+            "loss_r":  loss_r  * r_weight,
+            "loss_total": loss_cw * cw_weight + loss_r * r_weight,
+        }
+
+
+def build_network(img_size: Tuple[int, int] = (512, 512),
+                  num_room_classes: int = 23,
+                  num_cw_classes: int = 2) -> Network:
+    """Factory"""
+    net = Network(num_room_classes=num_room_classes, num_cw_classes=num_cw_classes)
+    dummy = tf.zeros([1, img_size[0], img_size[1], 3], dtype=tf.float32)
+    net.build(dummy.shape)
+    return net
