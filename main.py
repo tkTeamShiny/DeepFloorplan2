@@ -1,22 +1,25 @@
 # -*- coding: utf-8 -*-
 """
 DeepFloorplan2 - main.py
-- 既存の net.py に依存して学習/推論を実行
-- マスクは <ID>_multi.png のみを使用（索引マスク or RGB→索引に自動変換）
-- データ構成: data_root/{train,val}/{images,labels}
+- 既存(更新版) net.py に依存
+- フラット配置 or 任意構成のデータに対応（ZIP を渡せば自動展開＆再帰探索）
+- マスクは <ID>_multi.png（索引 or RGB→索引）を使用
 """
 
 import os
 import argparse
 from pathlib import Path
+import shutil
+import zipfile
+import tempfile
 
 import tensorflow as tf
 from tensorflow import keras
 
-# ここで既存(更新後)の net.py に依存
+# 依存（この会話で提示の更新版 net.py）
 from net import (
     set_global_seed,
-    discover_splits,
+    discover_pairs_and_splits,
     make_tf_dataset,
     build_model,
     MeanIoU,
@@ -25,27 +28,72 @@ from net import (
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--phase", type=str, default="Train", choices=["Train", "Test"],
-                   help="Train または Test を指定")
-    p.add_argument("--data_root", type=str, default="yolo",
-                   help="data_root/{train,val}/{images,labels} を想定")
+                   help="Train または Test")
+    # データ指定（どちらか一方、または両方）
+    p.add_argument("--data_zip", type=str, default="",
+                   help="データZIPへのパス（例: /mnt/data/YOLO_SetA_seg_no1_部屋種別改変版_flat.zip）")
+    p.add_argument("--data_root", type=str, default="",
+                   help="展開済みデータのルート（空なら ZIP を展開して自動決定）")
+
+    # 走査設定
+    p.add_argument("--mask_suffix", type=str, default="_multi.png",
+                   help="マスクのファイル名サフィックス（既定: _multi.png）")
+    p.add_argument("--val_ratio", type=float, default=0.1,
+                   help="val が見つからない場合の分割比（既定: 0.1 = 9:1）")
+
+    # 学習設定
     p.add_argument("--img_size", nargs=2, type=int, default=[512, 512],
-                   help="入力解像度 [H W]")
-    p.add_argument("--num_classes", type=int, default=10,
-                   help="クラス数（*_multi.png のラベル最大+1）")
+                   help="入力サイズ [H W]")
+    p.add_argument("--num_classes", type=int, default=23,
+                   help="クラス数（既定: 23）")
     p.add_argument("--batch_size", type=int, default=4)
     p.add_argument("--epochs", type=int, default=30)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--out_dir", type=str, default="runs")
     p.add_argument("--seed", type=int, default=42)
 
-    # Test 用
+    # 推論設定
     p.add_argument("--weights", type=str, default="runs/checkpoints/best.keras",
                    help="学習済み重み（.keras or .h5）")
-    p.add_argument("--test_split", type=str, default="val", choices=["train", "val"],
-                   help="推論対象の分割")
+    p.add_argument("--test_split", type=str, default="auto",
+                   choices=["auto", "train", "val"],
+                   help="推論対象分割。auto=val優先、無ければtrain")
     p.add_argument("--save_pred", type=str, default="runs/preds",
                    help="推論結果の保存先（PNGカラー可視化）")
     return p.parse_args()
+
+def _ensure_data_root(args):
+    """
+    data_root が空で data_zip が与えられたら ZIP を展開し、展開先を返す。
+    data_root が指定されていればそのまま返す。
+    """
+    if args.data_root:
+        root = Path(args.data_root).resolve()
+        if not root.exists():
+            raise FileNotFoundError(f"data_root not found: {root}")
+        return str(root)
+
+    if not args.data_zip:
+        raise ValueError("データが指定されていません。--data_zip か --data_root のどちらかを指定してください。")
+
+    zip_path = Path(args.data_zip).resolve()
+    if not zip_path.exists():
+        raise FileNotFoundError(f"ZIP not found: {zip_path}")
+
+    out_base = Path(args.out_dir) / "data_extracted"
+    if out_base.exists():
+        # 既存展開物を使い回し（再現性のため残す）
+        return str(out_base.resolve())
+
+    out_base.mkdir(parents=True, exist_ok=True)
+    print(f"[Info] extracting ZIP to: {out_base}")
+    with zipfile.ZipFile(str(zip_path), "r") as zf:
+        zf.extractall(str(out_base))
+    # 展開直下に一階層フォルダがある場合はそこをルートと見なす
+    candidates = [p for p in out_base.iterdir() if p.is_dir()]
+    root = candidates[0] if len(candidates) == 1 else out_base
+    print(f"[Info] data root resolved to: {root}")
+    return str(root.resolve())
 
 def train(args):
     set_global_seed(args.seed)
@@ -54,8 +102,14 @@ def train(args):
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     ckpt_path = ckpt_dir / "best.keras"
 
-    # データ検出（val が無ければ自動で 9:1 分割）
-    train_pairs, val_pairs = discover_splits(args.data_root)
+    data_root = _ensure_data_root(args)
+
+    # データ検出（val が無ければ自動分割）
+    train_pairs, val_pairs = discover_pairs_and_splits(
+        data_root=data_root,
+        mask_suffix=args.mask_suffix,
+        val_ratio=args.val_ratio,
+    )
 
     # tf.data の用意
     H, W = args.img_size
@@ -112,24 +166,42 @@ def train(args):
     print(f"[Best] checkpoint saved at: {ckpt_path}")
 
 def test(args):
-    from net import pair_image_mask_lists, read_image, colorize_index_mask
+    from net import colorize_index_mask, read_image
     import numpy as np
     from imageio.v2 import imwrite
 
-    H, W = args.img_size
-    split = args.test_split
-    img_dir = Path(args.data_root) / split / "images"
-    lab_dir = Path(args.data_root) / split / "labels"
-    pairs = pair_image_mask_lists(img_dir, lab_dir)
-    if not pairs:
-        raise RuntimeError(f"No pairs found under: {img_dir} / {lab_dir}")
+    data_root = _ensure_data_root(args)
+    # 分割の自動解決: val優先、無ければtrain
+    if args.test_split == "auto":
+        pref = ["val", "train"]
+    else:
+        pref = [args.test_split]
 
+    # 既存の探索関数を使ってペア集合を取得
+    all_train, all_val = discover_pairs_and_splits(
+        data_root=data_root,
+        mask_suffix=args.mask_suffix,
+        val_ratio=args.val_ratio,
+        split_only=True,  # 既存フォルダ構成を保持（無いときだけ分割情報が返る）
+    )
+
+    split_pairs = None
+    split_name = None
+    for name in pref:
+        if name == "val" and all_val:
+            split_pairs = all_val; split_name = "val"; break
+        if name == "train" and all_train:
+            split_pairs = all_train; split_name = "train"; break
+    if not split_pairs:
+        raise RuntimeError("テストに使える split が見つかりません。")
+
+    H, W = args.img_size
     print(f"[Info] loading weights: {args.weights}")
     model = keras.models.load_model(args.weights, custom_objects={"MeanIoU": MeanIoU})
     out_dir = Path(args.save_pred); out_dir.mkdir(parents=True, exist_ok=True)
 
-    for ip, _ in pairs:
-        img = read_image(ip, target_size=(H, W))  # float32 0-1, RGB
+    for ip, _ in split_pairs:
+        img = read_image(ip, (H, W))  # float32 0-1, RGB
         logits = model.predict(img[None, ...], verbose=0)[0]
         pred = np.argmax(logits, axis=-1).astype(np.uint8)
         rgb = colorize_index_mask(pred, args.num_classes)
