@@ -6,7 +6,7 @@ DeepFloorplan2 - net.py
 - TF2/Keras の軽量U-Netを内蔵（必要に応じて build_model を差し替えてOK）
 """
 
-import os, glob, random
+import os, random
 from pathlib import Path
 import numpy as np
 
@@ -69,39 +69,34 @@ def read_mask(path, target_size, num_classes=None):
 _IMG_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
 
 def _rglob_files(root: Path, exts):
-    files = []
-    for p in root.rglob("*"):
-        if p.is_file() and p.suffix.lower() in exts:
-            files.append(p)
-    return files
+    return [p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in exts]
 
 def pair_image_mask_lists_generic(root: Path, mask_suffix: str = "_multi.png"):
     """
     再帰的に画像と <stem> + mask_suffix を探索し、(image, mask) のリストを返す
-    - 画像: *_IMG_EXTS
-    - マスク: 同一stem + mask_suffix（場所はどこでもOK、優先は同ディレクトリ→labels/masks ディレクトリ）
     """
     root = Path(root)
     img_files = _rglob_files(root, _IMG_EXTS)
-    # マスク候補の高速ルックアップ用
-    #  stem -> [absolute paths of candidates]
+
+    # マスク候補を stem -> [paths] で引けるように用意
     mask_map = {}
     for p in root.rglob(f"*{mask_suffix}"):
         if p.is_file():
-            mask_map.setdefault(p.stem.replace(mask_suffix.replace(".png", ""), ""), []).append(p)
+            # stem から suffix を除いた基底名を推定
+            stem = p.stem
+            if stem.endswith(mask_suffix.replace(".png", "")):
+                stem = stem[: -len(mask_suffix.replace(".png", ""))]
+            mask_map.setdefault(stem, []).append(p)
 
     pairs = []
     for ip in sorted(img_files):
         stem = ip.stem
-        # 優先度: 同ディレクトリ /labels /masks をざっくり担保（候補が複数なら距離が近い順）
         cands = mask_map.get(stem, [])
         if not cands:
-            # 例: 画像が a/b/c/xxx.jpg のとき、xxx_multi.png を近隣に探すフォールバック
             local = list(ip.parent.glob(f"{stem}{mask_suffix}"))
             if local:
                 cands = local
         if cands:
-            # 近いパスを優先
             cands_sorted = sorted(cands, key=lambda p: len(os.path.relpath(str(p), start=str(ip.parent))))
             pairs.append((str(ip), str(cands_sorted[0])))
     return pairs
@@ -127,9 +122,8 @@ def _pair_yolo_like(root: Path, mask_suffix: str):
 def discover_pairs_and_splits(data_root: str, mask_suffix: str = "_multi.png",
                               val_ratio: float = 0.1, split_only: bool = False):
     """
-    data_root 直下が YOLOライク（train/images, train/labels, val/...）ならそれを採用。
-    そうでなければ、全体を再帰探索してペア集合を作り、val が存在しない場合は val_ratio で分割する。
-    split_only=True の場合、既存の構成を尊重（val が見つからねば train 全体のみ返す）。
+    data_root が YOLOライクならそれを採用。そうでない場合は再帰探索でペア集合を作る。
+    val がなければ val_ratio で分割。split_only=True なら既存構成を尊重（分割しない）。
     """
     root = Path(data_root)
     if not root.exists():
@@ -140,7 +134,6 @@ def discover_pairs_and_splits(data_root: str, mask_suffix: str = "_multi.png",
         if not train_pairs:
             raise RuntimeError(f"No train pairs found under YOLO-like layout: {root}")
         if not val_pairs and not split_only:
-            # val が無ければ分割
             n = len(train_pairs)
             k = max(1, int(n * val_ratio))
             val_pairs = train_pairs[:k]
@@ -150,25 +143,18 @@ def discover_pairs_and_splits(data_root: str, mask_suffix: str = "_multi.png",
             print(f"[Info] YOLO-like discovered: train={len(train_pairs)} val={len(val_pairs)}")
         return train_pairs, val_pairs
 
-    # 汎用フラット/任意構成
     all_pairs = pair_image_mask_lists_generic(root, mask_suffix=mask_suffix)
     if not all_pairs:
         raise RuntimeError(f"No (image, mask) pairs found in: {root} with suffix={mask_suffix}")
 
-    # train/val サブフォルダがあるかを簡易判定
-    train_hint = [p for p in (root / "train").rglob("*") if p.is_file()] if (root / "train").exists() else []
-    val_hint   = [p for p in (root / "val").rglob("*")   if p.is_file()] if (root / "val").exists() else []
+    train_hint = (root / "train").exists()
+    val_hint   = (root / "val").exists()
 
     if train_hint or val_hint:
-        # サブフォルダヒントに基づく割当（各ペアの画像パスが train/ または val/ を含むか）
         train_pairs = [(ip, mp) for ip, mp in all_pairs if "/train/" in Path(ip).as_posix()]
         val_pairs   = [(ip, mp) for ip, mp in all_pairs if "/val/"   in Path(ip).as_posix()]
         if not val_pairs and not split_only:
-            # val 無ければ分割
-            rest = [(ip, mp) for ip, mp in all_pairs if "/train/" in Path(ip).as_posix() or "/val/" in Path(ip).as_posix()]
-            base = train_pairs if train_pairs else rest
-            if not base:
-                base = all_pairs
+            base = train_pairs if train_pairs else all_pairs
             n = len(base)
             k = max(1, int(n * val_ratio))
             val_pairs = base[:k]
@@ -178,9 +164,8 @@ def discover_pairs_and_splits(data_root: str, mask_suffix: str = "_multi.png",
             print(f"[Info] flat hint discovered: train={len(train_pairs)} val={len(val_pairs)}")
         return train_pairs, val_pairs
 
-    # 完全フラット（train/val すら無い）: 分割 or split_only
+    # 完全フラット（train/val すら無い）
     if split_only:
-        # 既存分割は無いので train 全体のみ返す
         print(f"[Info] split_only: returning all as train, none as val (flat dataset)")
         return all_pairs, []
     n = len(all_pairs)
@@ -270,11 +255,12 @@ def build_model(input_shape, num_classes):
 class MeanIoU(tf.keras.metrics.Metric):
     """
     Keras MeanIoU を logits + sparse label で扱うラッパ
+    * シリアライズ対応のため get_config / from_config を実装
     """
     def __init__(self, num_classes, name="mean_iou", **kwargs):
         super().__init__(name=name, **kwargs)
-        self.num_classes = num_classes
-        self.miou = tf.keras.metrics.MeanIoU(num_classes=num_classes)
+        self.num_classes = int(num_classes)
+        self.miou = tf.keras.metrics.MeanIoU(num_classes=self.num_classes)
 
     def update_state(self, y_true, y_pred, sample_weight=None):
         y_pred = tf.argmax(y_pred, axis=-1, output_type=tf.int32)
@@ -285,6 +271,17 @@ class MeanIoU(tf.keras.metrics.Metric):
 
     def reset_state(self):
         self.miou.reset_state()
+
+    # --- ここからシリアライズ対応 ---
+    def get_config(self):
+        base = super().get_config()
+        base.update({"num_classes": self.num_classes})
+        return base
+
+    @classmethod
+    def from_config(cls, config):
+        num_classes = config.pop("num_classes")
+        return cls(num_classes=num_classes, **config)
 
 # ========== 可視化補助 ==========
 def colorize_index_mask(index_mask, num_classes):
