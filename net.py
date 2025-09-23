@@ -1,449 +1,202 @@
 # -*- coding: utf-8 -*-
 """
-TF2/Keras3 版 DeepFloorplan ドライバ（データ構成を自動検出）
-対応するディレクトリ例：
-  [A] r3d_index 方式：
-      data_root/
-        r3d_train.txt
-        r3d_val.txt     (任意)
-        r3d_test.txt    (任意)
-      - 行形式:
-          img_path, room_mask_path[, cw_mask_path]
-        もしくは空白区切り、相対パス可（data_root 起点）
-
-  [B] YOLO/flat 方式：
-      data_root/
-        train/images/*.jpg|png
-        train/masks/*.png              (任意)
-        train/labels/*.png             (任意)
-        images/*.jpg|png               (任意)
-        masks/*.png                    (任意)
-      - ラベル解決規則:
-         <stem><mask_suffix> を最優先（例: 1000001_multi.png）
-         次候補: <stem>_room.png / <stem>.png なども探索
+TF2/Keras3 版 DeepFloorplan 互換ネットワーク（固定レイヤー化）
+- すべてのレイヤーを __init__/build で作成し、call() では作成しない
+- 2ヘッド出力:
+    * logits_cw:   壁/境界 (C_cw=2 を想定)
+    * logits_r:    部屋タイプ (C_r=num_room_classes)
 """
 
 from __future__ import annotations
-import os
-import argparse
-from glob import glob
-from pathlib import Path
-from typing import Tuple, List, Optional, Dict
+from typing import Tuple, Dict, Optional
 
-import numpy as np
 import tensorflow as tf
-from tensorflow.keras import optimizers
+from tensorflow.keras import layers as L
+from tensorflow.keras import Model
 
-from net import build_network
 
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"  # INFO/WARN 抑制
+class ResBlock(L.Layer):
+    def __init__(self, filters: int, k: int = 3, d: int = 1, name: Optional[str] = None):
+        super().__init__(name=name)
+        self.filters = filters
+        self.k = k
+        self.d = d
 
-IMG_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")
+        # convs
+        self.conv1 = L.Conv2D(filters, k, padding="same", dilation_rate=d, use_bias=False)
+        self.bn1 = L.BatchNormalization()
+        self.act1 = L.ReLU()
 
-# -------------------------
-# パスユーティリティ
-# -------------------------
+        self.conv2 = L.Conv2D(filters, k, padding="same", dilation_rate=d, use_bias=False)
+        self.bn2 = L.BatchNormalization()
 
-def _ensure_dir(p: str):
-    Path(p).mkdir(parents=True, exist_ok=True)
+        # projection (build で入力チャンネルに応じて有効化)
+        self.proj_conv = None
+        self.proj_bn = None
+        self.act_out = L.ReLU()
 
-def _is_image(p: str) -> bool:
-    return p.lower().endswith(IMG_EXTS)
+    def build(self, input_shape):
+        in_ch = int(input_shape[-1])
+        if in_ch != self.filters:
+            self.proj_conv = L.Conv2D(self.filters, 1, padding="same", use_bias=False)
+            self.proj_bn = L.BatchNormalization()
+        super().build(input_shape)
 
-def _read_index_file(idx_path: str) -> List[List[str]]:
-    lines = []
-    with open(idx_path, "r", encoding="utf-8") as f:
-        for raw in f:
-            s = raw.strip()
-            if not s or s.startswith("#"):
-                continue
-            # カンマ優先、次に空白
-            if "," in s:
-                cols = [c.strip() for c in s.split(",")]
-            else:
-                cols = s.split()
-            if len(cols) < 2:
-                continue
-            lines.append(cols)
-    return lines
+    def call(self, x, training=False):
+        h = self.conv1(x)
+        h = self.bn1(h, training=training)
+        h = self.act1(h)
 
-def _resolve_rel(p: str, root: str) -> str:
-    q = Path(p)
-    if not q.is_absolute():
-        q = Path(root) / q
-    return str(q)
+        h = self.conv2(h)
+        h = self.bn2(h, training=training)
 
-def _list_images_candidates(root: str) -> List[str]:
-    pats = [
-        f"{root}/train/images/*",
-        f"{root}/images/*",
-        f"{root}/val/images/*",
-        f"{root}/test/images/*",
-        f"{root}/*",
-    ]
-    files = []
-    for p in pats:
-        files.extend([f for f in glob(p) if _is_image(f)])
-    return sorted(set(files))
+        shortcut = x
+        if self.proj_conv is not None:
+            shortcut = self.proj_conv(shortcut)
+            shortcut = self.proj_bn(shortcut, training=training)
 
-def _label_search_dirs(img_path: str) -> List[str]:
-    img_dir = Path(img_path).parent
-    dirs = [
-        img_dir,
-        img_dir / "masks",
-        img_dir / "labels",
-        img_dir.parent / "masks",
-        img_dir.parent / "labels",
-        img_dir.parent / "annotations",
-        img_dir.parent,
-    ]
-    uniq = []
-    for d in dirs:
-        d = str(d)
-        if d not in uniq:
-            uniq.append(d)
-    return uniq
+        out = L.Add()([h, shortcut])
+        out = self.act_out(out)
+        return out
 
-def _find_label_for_image(img_path: str,
-                          mask_suffix: str,
-                          fallback_suffixes: List[str]) -> Optional[str]:
-    stem = Path(img_path).stem
-    search_dirs = _label_search_dirs(img_path)
 
-    cand_names = [f"{stem}{mask_suffix}"] if mask_suffix else []
-    cand_names += [f"{stem}{suf}" for suf in fallback_suffixes]
+class DownBlock(L.Layer):
+    """ MaxPool2D -> ResBlock """
+    def __init__(self, filters: int, k: int = 3, d: int = 1, name: Optional[str] = None):
+        super().__init__(name=name)
+        self.pool = L.MaxPool2D(2)
+        self.res = ResBlock(filters, k=k, d=d)
 
-    for d in search_dirs:
-        for name in cand_names:
-            c = str(Path(d) / name)
-            if os.path.isfile(c):
-                return c
-    return None
+    def call(self, x, training=False):
+        x = self.pool(x)
+        x = self.res(x, training=training)
+        return x
 
-# -------------------------
-# 画像 / ラベル読み込み
-# -------------------------
 
-def _load_image(path: str, img_size: Tuple[int, int]) -> np.ndarray:
-    data = tf.io.read_file(path)
-    img  = tf.image.decode_image(data, channels=3, expand_animations=False)
-    img  = tf.image.resize(img, img_size, method="bilinear")
-    img  = tf.cast(img, tf.float32) / 255.0
-    return img.numpy()
+class UpBlock(L.Layer):
+    """ UpSampling2D -> Concat(skip) -> ResBlock """
+    def __init__(self, filters: int, k: int = 3, d: int = 1, name: Optional[str] = None):
+        super().__init__(name=name)
+        self.up = L.UpSampling2D(size=2, interpolation="bilinear")
+        self.concat = L.Concatenate()
+        self.res = ResBlock(filters, k=k, d=d)
 
-def _load_label(path: str, img_size: Tuple[int, int]) -> np.ndarray:
-    data = tf.io.read_file(path)
-    lab  = tf.image.decode_image(data, channels=1, expand_animations=False)
-    lab  = tf.image.resize(lab, img_size, method="nearest")
-    lab  = tf.squeeze(tf.cast(lab, tf.int32), axis=-1)
-    return lab.numpy()
+    def call(self, x, skip, training=False):
+        x = self.up(x)
+        x = self.concat([x, skip])
+        x = self.res(x, training=training)
+        return x
 
-# -------------------------
-# データセット構築（Train）
-# -------------------------
 
-def make_dataset_train(data_root: str,
-                       img_size: Tuple[int, int],
-                       num_room_classes: int,
-                       mask_suffix: str = "_multi.png",
-                       cw_suffix_hint: Optional[str] = None,
-                       batch_size: int = 4,
-                       shuffle: bool = True):
-    root = data_root
-    idx_path = Path(root) / "r3d_train.txt"
-    pairs = []
+class Network(Model):
+    """
+    Keras Model 実装（動的レイヤー生成なし）
+    Attributes:
+        num_room_classes: 部屋クラス数（r ヘッド）
+        num_cw_classes:   境界クラス数（cw ヘッド）
+    """
+    def __init__(self,
+                 num_room_classes: int,
+                 num_cw_classes: int = 2,
+                 base_channels: int = 64,
+                 name: str = "DeepFloorplanMTL",
+                 **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.num_room_classes = num_room_classes
+        self.num_cw_classes = num_cw_classes
+        ch = base_channels
 
-    if idx_path.is_file():
-        rows = _read_index_file(str(idx_path))
-        print(f"[Train] r3d index found: {idx_path} (rows={len(rows)})")
-        for cols in rows:
-            if len(cols) == 2:
-                img_p, room_p = cols[0], cols[1]
-                cw_p = None
-            else:
-                a, b, c = cols[0], cols[1], cols[2]
-                img_p = a
-                if any(x in b.lower() for x in ["_room", "room", "multi", "rooms"]):
-                    room_p, cw_p = b, c
-                elif any(x in c.lower() for x in ["_room", "room", "multi", "rooms"]):
-                    room_p, cw_p = c, b
-                else:
-                    room_p, cw_p = b, c
+        # Encoder stem
+        self.stem_conv = L.Conv2D(ch, 7, strides=2, padding="same", use_bias=False)
+        self.stem_bn = L.BatchNormalization()
+        self.stem_act = L.ReLU()
 
-            img_abs  = _resolve_rel(img_p, root)
-            room_abs = _resolve_rel(room_p, root)
-            cw_abs   = _resolve_rel(cw_p, root) if cw_p else None
+        # Encoder levels
+        self.enc1 = ResBlock(ch, name="enc1")        # 1/2
+        self.enc2 = DownBlock(ch * 2, name="enc2")   # 1/4
+        self.enc3 = DownBlock(ch * 4, name="enc3")   # 1/8
+        self.enc4 = DownBlock(ch * 8, name="enc4")   # 1/16
 
-            if not os.path.isfile(img_abs):
-                print(f"[Warn] image not found: {img_abs} -> skip")
-                continue
-            if not os.path.isfile(room_abs):
-                print(f"[Warn] room label not found: {room_abs} -> skip")
-                continue
-            if cw_abs and (not os.path.isfile(cw_abs)):
-                print(f"[Warn] cw label not found: {cw_abs} -> ignore cw")
-                cw_abs = None
+        # Bottleneck (dilated)
+        self.bottleneck1 = ResBlock(ch * 8, d=2, name="bneck1")
+        self.bottleneck2 = ResBlock(ch * 8, d=4, name="bneck2")
 
-            pairs.append((img_abs, cw_abs, room_abs))
+        # Decoder
+        self.dec3 = UpBlock(ch * 4, name="dec3")     # 1/8
+        self.dec3_conv = L.Conv2D(ch * 4, 3, padding="same", activation="relu")
 
-    else:
-        imgs = _list_images_candidates(root)
-        print(f"[Train] images discovered: {len(imgs)}")
-        if len(imgs) == 0:
-            raise RuntimeError("学習用の画像が見つかりませんでした。data_root 配下をご確認ください。")
+        self.dec2 = UpBlock(ch * 2, name="dec2")     # 1/4
+        self.dec2_conv = L.Conv2D(ch * 2, 3, padding="same", activation="relu")
 
-        fb = []
-        if mask_suffix and mask_suffix != "_multi.png":
-            fb.append("_multi.png")
-        fb += ["_room.png", "_rooms.png", ".png"]
+        self.dec1 = UpBlock(ch, name="dec1")         # 1/2
+        self.dec1_conv = L.Conv2D(ch, 3, padding="same", activation="relu")
 
-        for img in imgs:
-            room_lbl = _find_label_for_image(img, mask_suffix=mask_suffix, fallback_suffixes=fb)
-            if room_lbl is None:
-                continue
+        self.up0 = L.UpSampling2D(size=2, interpolation="bilinear")  # 1/1
+        self.dec0_conv = L.Conv2D(ch, 3, padding="same", activation="relu")
 
-            cw_lbl = None
-            cw_candidates = []
-            if cw_suffix_hint:
-                cw_candidates.append(cw_suffix_hint)
-            cw_candidates += ["_cw.png", "_closewall.png", "_close_wall.png", "_boundary.png"]
-            for suf in cw_candidates:
-                cw_try = _find_label_for_image(img, mask_suffix=suf, fallback_suffixes=[])
-                if cw_try is not None:
-                    cw_lbl = cw_try
-                    break
+        # Heads
+        self.head_cw = L.Conv2D(self.num_cw_classes, 1, name="logits_cw")
+        self.head_r  = L.Conv2D(self.num_room_classes, 1, name="logits_r")
 
-            pairs.append((img, cw_lbl, room_lbl))
+    def call(self, x, training=False):
+        # Encoder
+        x0 = self.stem_conv(x)
+        x0 = self.stem_bn(x0, training=training)
+        x0 = self.stem_act(x0)
 
-    if len(pairs) == 0:
-        raise RuntimeError("学習用の (画像, roomラベル) が見つかりませんでした。アップロード構成（r3d_train.txt / *_multi.png など）をご確認ください。")
+        s1 = self.enc1(x0, training=training)   # 1/2
+        s2 = self.enc2(s1, training=training)   # 1/4
+        s3 = self.enc3(s2, training=training)   # 1/8
+        s4 = self.enc4(s3, training=training)   # 1/16
 
-    print(f"[Train] usable pairs: {len(pairs)}")
-    for i in range(min(5, len(pairs))):
-        print(f"  [sample#{i+1}] img={pairs[i][0]}\n               room={pairs[i][2]}\n               cw={pairs[i][1]}")
+        # Bottleneck
+        b = self.bottleneck1(s4, training=training)
+        b = self.bottleneck2(b, training=training)
 
-    def _gen():
-        for img, cw_lbl, room_lbl in pairs:
-            img_np  = _load_image(img, img_size)
-            room_np = _load_label(room_lbl, img_size)
-            if cw_lbl is not None:
-                cw_np = _load_label(cw_lbl, img_size)
-            else:
-                cw_np = np.zeros_like(room_np, dtype=np.int32)
-            yield img_np, cw_np, room_np
+        # Decoder
+        d3 = self.dec3(b, s3, training=training)
+        d3 = self.dec3_conv(d3)
 
-    ds = tf.data.Dataset.from_generator(
-        _gen,
-        output_signature=(
-            tf.TensorSpec(shape=(img_size[0], img_size[1], 3), dtype=tf.float32),
-            tf.TensorSpec(shape=(img_size[0], img_size[1]), dtype=tf.int32),
-            tf.TensorSpec(shape=(img_size[0], img_size[1]), dtype=tf.int32),
-        ),
-    )
-    if shuffle:
-        ds = ds.shuffle(buffer_size=min(200, len(pairs)))
-    ds = ds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
-    return ds, len(pairs)
+        d2 = self.dec2(d3, s2, training=training)
+        d2 = self.dec2_conv(d2)
 
-# -------------------------
-# データセット構築（Test）
-# -------------------------
+        d1 = self.dec1(d2, s1, training=training)
+        d1 = self.dec1_conv(d1)
 
-def make_dataset_test(data_root: str,
-                      img_size: Tuple[int, int],
-                      batch_size: int = 1):
-    root = data_root
-    idx_test = Path(root) / "r3d_test.txt"
-    idx_val  = Path(root) / "r3d_val.txt"
+        d0 = self.up0(d1)
+        d0 = self.dec0_conv(d0)
 
-    img_files = []
-    picked_idx = None
-    if idx_test.is_file():
-        rows = _read_index_file(str(idx_test))
-        picked_idx = idx_test
-        for cols in rows:
-            if len(cols) == 0:
-                continue
-            img_files.append(_resolve_rel(cols[0], root))
-    elif idx_val.is_file():
-        rows = _read_index_file(str(idx_val))
-        picked_idx = idx_val
-        for cols in rows:
-            if len(cols) == 0:
-                continue
-            img_files.append(_resolve_rel(cols[0], root))
-    else:
-        img_files = _list_images_candidates(root)
+        # Heads (logits)
+        logits_cw = self.head_cw(d0)
+        logits_r  = self.head_r(d0)
+        return logits_cw, logits_r
 
-    img_files = [p for p in img_files if os.path.isfile(p)]
-    if len(img_files) == 0:
-        raise RuntimeError("推論対象の画像が見つかりませんでした。data_root 配下をご確認ください。")
-    if picked_idx:
-        print(f"[Test] index used: {picked_idx} (images={len(img_files)})")
-    else:
-        print(f"[Test] images discovered: {len(img_files)})")
+    @staticmethod
+    def losses_dict(y_true_cw, y_true_r, y_pred_cw, y_pred_r,
+                    cw_weight: float = 1.0, r_weight: float = 1.0) -> Dict[str, tf.Tensor]:
+        y_true_cw = tf.cast(y_true_cw, tf.int32)
+        y_true_r  = tf.cast(y_true_r, tf.int32)
 
-    def _gen():
-        for p in img_files:
-            img_np = _load_image(p, img_size)
-            yield img_np, p
+        loss_cw = tf.keras.losses.sparse_categorical_crossentropy(
+            y_true_cw, y_pred_cw, from_logits=True)
+        loss_r  = tf.keras.losses.sparse_categorical_crossentropy(
+            y_true_r, y_pred_r, from_logits=True)
 
-    ds = tf.data.Dataset.from_generator(
-        _gen,
-        output_signature=(
-            tf.TensorSpec(shape=(img_size[0], img_size[1], 3), dtype=tf.float32),
-            tf.TensorSpec(shape=(), dtype=tf.string),
-        ),
-    ).batch(batch_size).prefetch(tf.data.AUTOTUNE)
-    return ds, img_files
+        loss_cw = tf.reduce_mean(loss_cw)
+        loss_r  = tf.reduce_mean(loss_r)
 
-# -------------------------
-# 学習 / 推論ループ
-# -------------------------
+        return {
+            "loss_cw": loss_cw * cw_weight,
+            "loss_r":  loss_r  * r_weight,
+            "loss_total": loss_cw * cw_weight + loss_r * r_weight,
+        }
 
-@tf.function(jit_compile=False)
-def _train_step(model, optimizer, images, labels_cw, labels_r):
-    with tf.GradientTape() as tape:
-        logits_cw, logits_r = model(images, training=True)
-        losses = model.losses_dict(labels_cw, labels_r, logits_cw, logits_r)
-    grads = tape.gradient(losses["loss_total"], model.trainable_variables)
-    optimizer.apply_gradients(zip(grads, model.trainable_variables))
-    return losses
 
-def train(cfg):
-    img_h, img_w = cfg.img_size
-    ds, n_samples = make_dataset_train(
-        cfg.data_root, (img_h, img_w),
-        num_room_classes=cfg.num_classes,
-        mask_suffix=cfg.mask_suffix,
-        cw_suffix_hint=cfg.cw_suffix_hint,
-        batch_size=cfg.batch_size,
-        shuffle=True
-    )
-    steps_per_epoch = max(1, n_samples // cfg.batch_size)
-
-    model = build_network(img_size=(img_h, img_w),
-                          num_room_classes=cfg.num_classes,
-                          num_cw_classes=2)
-    optimizer = optimizers.Adam(learning_rate=cfg.lr)
-
-    _ensure_dir(os.path.dirname(cfg.weights))
-    ckpt = tf.train.Checkpoint(model=model, optimizer=optimizer)
-    ckpt_mgr = tf.train.CheckpointManager(ckpt, directory=os.path.dirname(cfg.weights), max_to_keep=3)
-
-    if os.path.isfile(cfg.weights):
-        try:
-            ckpt.restore(cfg.weights)
-            print(f"[Info] restored from {cfg.weights}")
-        except Exception as e:
-            print(f"[Warn] failed to restore: {e}")
-
-    for ep in range(cfg.epochs):
-        hist = {"loss_total": [], "loss_cw": [], "loss_r": []}
-        for batch in ds:
-            images, labels_cw, labels_r = batch
-            losses = _train_step(model, optimizer, images, labels_cw, labels_r)
-            for k in hist.keys():
-                hist[k].append(float(losses[k].numpy()))
-
-        log = ", ".join([f"{k}={np.mean(v):.4f}" for k, v in hist.items()])
-        print(f"[Train][ep={ep+1}/{cfg.epochs}] {log}")
-
-        save_path = ckpt_mgr.save()
-        try:
-            model.save(cfg.weights.replace(".ckpt", ".keras"))
-        except Exception:
-            pass
-        print(f"[Info] checkpoint saved to {save_path}")
-
-def test(cfg):
-    img_h, img_w = cfg.img_size
-    ds, files = make_dataset_test(cfg.data_root, (img_h, img_w), batch_size=1)
-
-    model = build_network(img_size=(img_h, img_w),
-                          num_room_classes=cfg.num_classes,
-                          num_cw_classes=2)
-
-    loaded = False
-    if os.path.isfile(cfg.weights):
-        try:
-            tf.train.Checkpoint(model=model).restore(cfg.weights).expect_partial()
-            print(f"[Info] loaded ckpt: {cfg.weights}")
-            loaded = True
-        except Exception as e:
-            print(f"[Warn] ckpt restore failed: {e}")
-    keras_path = cfg.weights if cfg.weights.endswith(".keras") else cfg.weights + ".keras"
-    if (not loaded) and os.path.isfile(keras_path):
-        try:
-            m2 = tf.keras.models.load_model(keras_path, compile=False)
-            for w_src, w_dst in zip(m2.weights, model.weights):
-                w_dst.assign(w_src)
-            print(f"[Info] loaded keras: {keras_path}")
-            loaded = True
-        except Exception as e:
-            print(f"[Warn] keras load failed: {e}")
-
-    if not loaded:
-        print("[Warn] weights not found. Using randomly initialized weights.")
-
-    _ensure_dir(cfg.save_pred)
-
-    for images, pth in ds:
-        logits_cw, logits_r = model(images, training=False)
-        pred_r = tf.argmax(logits_r, axis=-1)[0].numpy().astype(np.uint8)
-        stem = Path(bytes(pth.numpy()[0]).decode()).stem
-        out_path = os.path.join(cfg.save_pred, f"{stem}_room_pred.png")
-        tf.keras.utils.save_img(out_path, pred_r, scale=False)
-        print(f"[Save] {out_path}")
-
-# -------------------------
-# エントリポイント
-# -------------------------
-
-def parse_args():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--phase", type=str, default="Train", choices=["Train", "Test"])
-    ap.add_argument("--data_root", type=str, required=True)
-    ap.add_argument("--img_size", type=int, nargs=2, default=[512, 512])
-    ap.add_argument("--num_classes", type=int, default=23)
-    ap.add_argument("--batch_size", type=int, default=4)
-    ap.add_argument("--epochs", type=int, default=30)
-    ap.add_argument("--lr", type=float, default=1e-3)
-    ap.add_argument("--out_dir", type=str, default="runs")
-    ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--weights", type=str, default="runs/checkpoints/best.ckpt")
-    ap.add_argument("--save_pred", type=str, default="runs/preds")
-    ap.add_argument("--mask_suffix", type=str, default="_multi.png",
-                    help="部屋ラベルのサフィックス（例: _multi.png, _room.png）")
-    ap.add_argument("--cw_suffix_hint", type=str, default=None,
-                    help="境界ラベルのサフィックスヒント（例: _cw.png, _close_wall.png）")
-    return ap.parse_args()
-
-def main():
-    cfg = parse_args()
-    np.random.seed(cfg.seed)
-    tf.random.set_seed(cfg.seed)
-
-    print("========== Config ==========")
-    print(f"phase: {cfg.phase}")
-    print(f"data_root: {cfg.data_root}")
-    print(f"img_size: {tuple(cfg.img_size)}")
-    print(f"num_classes: {cfg.num_classes}")
-    print(f"batch_size: {cfg.batch_size}")
-    print(f"epochs: {cfg.epochs}")
-    print(f"lr: {cfg.lr}")
-    print(f"out_dir: {cfg.out_dir}")
-    print(f"seed: {cfg.seed}")
-    print(f"weights: {cfg.weights}")
-    print(f"save_pred: {cfg.save_pred}")
-    print(f"mask_suffix: {cfg.mask_suffix}")
-    print(f"cw_suffix_hint: {cfg.cw_suffix_hint}")
-    print("============================")
-
-    if cfg.phase.lower() == "train":
-        train(cfg)
-    else:
-        test(cfg)
-
-if __name__ == "__main__":
-    main()
+def build_network(img_size: Tuple[int, int] = (512, 512),
+                  num_room_classes: int = 23,
+                  num_cw_classes: int = 2) -> Network:
+    """Factory: ここではレイヤーは __init__ 時点で作成されるため build は不要"""
+    net = Network(num_room_classes=num_room_classes, num_cw_classes=num_cw_classes)
+    # Keras に形状を伝えて重み初期化したい場合はダミーを一度通す
+    _ = net(tf.zeros([1, img_size[0], img_size[1], 3], dtype=tf.float32), training=False)
+    return net
