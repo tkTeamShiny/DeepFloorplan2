@@ -9,9 +9,7 @@ DeepFloorplan2 - main.py
 import os
 import argparse
 from pathlib import Path
-import shutil
 import zipfile
-import tempfile
 
 import tensorflow as tf
 from tensorflow import keras
@@ -23,6 +21,8 @@ from net import (
     make_tf_dataset,
     build_model,
     MeanIoU,
+    colorize_index_mask,
+    read_image,
 )
 
 def parse_args():
@@ -134,7 +134,7 @@ def train(args):
     model = build_model(input_shape=(H, W, 3), num_classes=args.num_classes)
     opt = keras.optimizers.Adam(learning_rate=args.lr)
     loss = keras.losses.SparseCategoricalCrossentropy(from_logits=True)
-    metrics = [MeanIoU(args.num_classes)]
+    metrics = [MeanIoU(num_classes=args.num_classes)]
 
     model.compile(optimizer=opt, loss=loss, metrics=metrics)
     model.summary()
@@ -156,7 +156,7 @@ def train(args):
         keras.callbacks.CSVLogger(str(Path(args.out_dir) / "train_log.csv")),
     ]
 
-    history = model.fit(
+    _ = model.fit(
         train_ds,
         validation_data=val_ds,
         epochs=args.epochs,
@@ -166,7 +166,6 @@ def train(args):
     print(f"[Best] checkpoint saved at: {ckpt_path}")
 
 def test(args):
-    from net import colorize_index_mask, read_image
     import numpy as np
     from imageio.v2 import imwrite
 
@@ -186,18 +185,23 @@ def test(args):
     )
 
     split_pairs = None
-    split_name = None
     for name in pref:
         if name == "val" and all_val:
-            split_pairs = all_val; split_name = "val"; break
+            split_pairs = all_val; break
         if name == "train" and all_train:
-            split_pairs = all_train; split_name = "train"; break
+            split_pairs = all_train; break
     if not split_pairs:
         raise RuntimeError("テストに使える split が見つかりません。")
 
     H, W = args.img_size
     print(f"[Info] loading weights: {args.weights}")
-    model = keras.models.load_model(args.weights, custom_objects={"MeanIoU": MeanIoU})
+    # ★ 推論だけなので compile=False でロード（カスタムメトリクス逆シリアライズ問題を回避）
+    model = keras.models.load_model(
+        args.weights,
+        custom_objects={"MeanIoU": MeanIoU},  # 再学習再開用に残す
+        compile=False
+    )
+
     out_dir = Path(args.save_pred); out_dir.mkdir(parents=True, exist_ok=True)
 
     for ip, _ in split_pairs:
