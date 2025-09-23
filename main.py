@@ -1,230 +1,320 @@
 # -*- coding: utf-8 -*-
 """
-DeepFloorplan2 - main.py
-- 既存(更新版) net.py に依存
-- フラット配置 or 任意構成のデータに対応（ZIP を渡せば自動展開＆再帰探索）
-- マスクは <ID>_multi.png（索引 or RGB→索引）を使用
+TF2/Keras3 版 DeepFloorplan 互換ドライバ
+- zlzeng/DeepFloorplan の main.py のオプション構成に合わせた CLI
+- Train / Test フェーズ両対応
+- データ構成（例）:
+    data_root/
+      images/               ... 入力画像 (.jpg/.png)
+      masks/                ... 教師ラベル（multi ラベル or 個別ラベル）
+         *_cw.png           ... 0/1 の境界ラベル（任意）
+         *_room.png         ... 0..C-1 の部屋種別ラベル
+         *_multi.png        ... まとめラベル（r を主で利用）
+    もしくは YOLO-like:
+      train/images, train/labels (未使用)
+      val/images, val/labels     (推論可)
+- Test は画像だけあれば OK（room ヘッドの argmax を出力）
 """
 
+from __future__ import annotations
 import os
 import argparse
+from glob import glob
 from pathlib import Path
-import zipfile
+from typing import Tuple, List, Optional, Dict
 
+import numpy as np
 import tensorflow as tf
-from tensorflow import keras
+from tensorflow.keras import optimizers
 
-# 依存（この会話で提示の更新版 net.py）
-from net import (
-    set_global_seed,
-    discover_pairs_and_splits,
-    make_tf_dataset,
-    build_model,
-    MeanIoU,
-    colorize_index_mask,
-    read_image,
-)
+from net import build_network
+
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"  # INFO/WARN 抑制
+
+# -------------------------
+# ユーティリティ
+# -------------------------
+
+IMG_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")
+
+def _list_images(root: str) -> List[str]:
+    pats = [
+        f"{root}/images/*",
+        f"{root}/train/images/*",
+        f"{root}/val/images/*",
+        f"{root}/*",  # 直下置き
+    ]
+    files = []
+    for p in pats:
+        files.extend([f for f in glob(p) if f.lower().endswith(IMG_EXTS)])
+    return sorted(set(files))
+
+def _match_label_path(img_path: str, lbl_root: str, suffix: str) -> Optional[str]:
+    """
+    画像ファイル名に対応するラベルを推定:
+      - <stem>_<suffix>.png
+      - <stem>.png （suffix 無し）
+    """
+    stem = Path(img_path).stem
+    cands = [
+        os.path.join(lbl_root, f"{stem}_{suffix}.png"),
+        os.path.join(lbl_root, f"{stem}.png"),
+    ]
+    for c in cands:
+        if os.path.isfile(c):
+            return c
+    return None
+
+def _load_image(path: str, img_size: Tuple[int, int]) -> np.ndarray:
+    """HWC, float32[0,1], RGB"""
+    data = tf.io.read_file(path)
+    img  = tf.image.decode_image(data, channels=3, expand_animations=False)
+    img  = tf.image.resize(img, img_size, method="bilinear")
+    img  = tf.cast(img, tf.float32) / 255.0
+    return img.numpy()
+
+def _load_label(path: str, img_size: Tuple[int, int]) -> np.ndarray:
+    """HW int32"""
+    data = tf.io.read_file(path)
+    lab  = tf.image.decode_image(data, channels=1, expand_animations=False)
+    lab  = tf.image.resize(lab, img_size, method="nearest")
+    lab  = tf.squeeze(tf.cast(lab, tf.int32), axis=-1)
+    return lab.numpy()
+
+def _ensure_dir(p: str):
+    Path(p).mkdir(parents=True, exist_ok=True)
+
+# -------------------------
+# データセット
+# -------------------------
+
+def make_dataset_train(data_root: str,
+                       img_size: Tuple[int, int],
+                       num_room_classes: int,
+                       cw_suffix: str = "cw",
+                       room_suffix: str = "room",
+                       multi_suffix: str = "multi",
+                       batch_size: int = 4,
+                       shuffle: bool = True):
+    """
+    学習用: cw と room の教師を探す
+    - masks/ に *_cw.png と *_room.png があれば優先
+    - *_multi.png のみの場合、room を multi から読み込む（cw は未使用/ゼロ）
+    """
+    img_files = _list_images(data_root)
+    masks_dir = os.path.join(data_root, "masks")
+    pairs = []
+
+    for img in img_files:
+        room_lbl = _match_label_path(img, masks_dir, room_suffix)
+        cw_lbl   = _match_label_path(img, masks_dir, cw_suffix)
+        multi    = _match_label_path(img, masks_dir, multi_suffix)
+
+        if room_lbl is None and multi is not None:
+            room_lbl = multi
+
+        if room_lbl is None:
+            # 学習用は room ラベル必須
+            continue
+
+        pairs.append((img, cw_lbl, room_lbl))
+
+    if len(pairs) == 0:
+        raise RuntimeError("学習用の (画像, roomラベル) が見つかりませんでした。masks ディレクトリをご確認ください。")
+
+    def _gen():
+        for img, cw_lbl, room_lbl in pairs:
+            img_np  = _load_image(img, img_size)
+            room_np = _load_label(room_lbl, img_size)
+            if cw_lbl is not None:
+                cw_np = _load_label(cw_lbl, img_size)
+            else:
+                cw_np = np.zeros_like(room_np, dtype=np.int32)
+
+            yield img_np, cw_np, room_np
+
+    ds = tf.data.Dataset.from_generator(
+        _gen,
+        output_signature=(
+            tf.TensorSpec(shape=(img_size[0], img_size[1], 3), dtype=tf.float32),
+            tf.TensorSpec(shape=(img_size[0], img_size[1]), dtype=tf.int32),
+            tf.TensorSpec(shape=(img_size[0], img_size[1]), dtype=tf.int32),
+        ),
+    )
+    if shuffle:
+        ds = ds.shuffle(buffer_size=min(200, len(pairs)))
+    ds = ds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+    return ds, len(pairs)
+
+def make_dataset_test(data_root: str,
+                      img_size: Tuple[int, int],
+                      batch_size: int = 1):
+    img_files = _list_images(data_root)
+    if len(img_files) == 0:
+        raise RuntimeError("推論対象の画像が見つかりませんでした。data_root 配下の images/ などをご確認ください。")
+
+    def _gen():
+        for p in img_files:
+            img_np = _load_image(p, img_size)
+            yield img_np, p
+
+    ds = tf.data.Dataset.from_generator(
+        _gen,
+        output_signature=(
+            tf.TensorSpec(shape=(img_size[0], img_size[1], 3), dtype=tf.float32),
+            tf.TensorSpec(shape=(), dtype=tf.string),
+        ),
+    ).batch(batch_size).prefetch(tf.data.AUTOTUNE)
+    return ds, img_files
+
+# -------------------------
+# ループ
+# -------------------------
+
+@tf.function(jit_compile=False)
+def _train_step(model, optimizer, images, labels_cw, labels_r):
+    with tf.GradientTape() as tape:
+        logits_cw, logits_r = model(images, training=True)
+        losses = model.losses_dict(labels_cw, labels_r, logits_cw, logits_r)
+    grads = tape.gradient(losses["loss_total"], model.trainable_variables)
+    optimizer.apply_gradients(zip(grads, model.trainable_variables))
+    return losses
+
+def train(cfg):
+    img_h, img_w = cfg.img_size
+    ds, n_samples = make_dataset_train(cfg.data_root, (img_h, img_w),
+                                       num_room_classes=cfg.num_classes,
+                                       cw_suffix="close_wall",  # 既定名例: *_close_wall.png
+                                       room_suffix="room",
+                                       multi_suffix="multi",
+                                       batch_size=cfg.batch_size,
+                                       shuffle=True)
+    steps_per_epoch = max(1, n_samples // cfg.batch_size)
+
+    model = build_network(img_size=(img_h, img_w),
+                          num_room_classes=cfg.num_classes,
+                          num_cw_classes=2)
+    optimizer = optimizers.Adam(learning_rate=cfg.lr)
+
+    # チェックポイント
+    _ensure_dir(os.path.dirname(cfg.weights))
+    ckpt = tf.train.Checkpoint(model=model, optimizer=optimizer)
+    ckpt_mgr = tf.train.CheckpointManager(ckpt, directory=os.path.dirname(cfg.weights), max_to_keep=3)
+
+    # 既存読み込み
+    if os.path.isfile(cfg.weights):
+        try:
+            ckpt.restore(cfg.weights)
+            print(f"[Info] restored from {cfg.weights}")
+        except Exception as e:
+            print(f"[Warn] failed to restore: {e}")
+
+    for ep in range(cfg.epochs):
+        hist = {"loss_total": [], "loss_cw": [], "loss_r": []}
+        for batch in ds:
+            images, labels_cw, labels_r = batch
+            losses = _train_step(model, optimizer, images, labels_cw, labels_r)
+            for k in hist.keys():
+                hist[k].append(float(losses[k].numpy()))
+
+        # ログ
+        log = ", ".join([f"{k}={np.mean(v):.4f}" for k, v in hist.items()])
+        print(f"[Train][ep={ep+1}/{cfg.epochs}] {log}")
+
+        # save
+        save_path = ckpt_mgr.save()
+        # 互換のため .keras も保存（デプロイ簡便化）
+        try:
+            model.save(cfg.weights.replace(".ckpt", ".keras"))
+        except Exception:
+            pass
+        print(f"[Info] checkpoint saved to {save_path}")
+
+def test(cfg):
+    img_h, img_w = cfg.img_size
+    ds, files = make_dataset_test(cfg.data_root, (img_h, img_w), batch_size=1)
+
+    model = build_network(img_size=(img_h, img_w),
+                          num_room_classes=cfg.num_classes,
+                          num_cw_classes=2)
+
+    # 重みロード: .ckpt 優先、失敗したら .keras
+    loaded = False
+    if os.path.isfile(cfg.weights):
+        try:
+            tf.train.Checkpoint(model=model).restore(cfg.weights).expect_partial()
+            print(f"[Info] loaded ckpt: {cfg.weights}")
+            loaded = True
+        except Exception as e:
+            print(f"[Warn] ckpt restore failed: {e}")
+    keras_path = cfg.weights if cfg.weights.endswith(".keras") else cfg.weights + ".keras"
+    if (not loaded) and os.path.isfile(keras_path):
+        try:
+            # Keras の save/load 互換保持のために別 Model をロードして重みコピー
+            m2 = tf.keras.models.load_model(keras_path, compile=False)
+            for w_src, w_dst in zip(m2.weights, model.weights):
+                w_dst.assign(w_src)
+            print(f"[Info] loaded keras: {keras_path}")
+            loaded = True
+        except Exception as e:
+            print(f"[Warn] keras load failed: {e}")
+
+    if not loaded:
+        print("[Warn] weights not found. Using randomly initialized weights.")
+
+    _ensure_dir(cfg.save_pred)
+
+    for images, pth in ds:
+        logits_cw, logits_r = model(images, training=False)
+        pred_r = tf.argmax(logits_r, axis=-1)[0].numpy().astype(np.uint8)  # HW
+        # 保存
+        stem = Path(bytes(pth.numpy()[0]).decode()).stem
+        out_path = os.path.join(cfg.save_pred, f"{stem}_room_pred.png")
+        tf.keras.utils.save_img(out_path, pred_r, scale=False)
+        print(f"[Save] {out_path}")
+
+# -------------------------
+# エントリポイント
+# -------------------------
 
 def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--phase", type=str, default="Train", choices=["Train", "Test"],
-                   help="Train または Test")
-    # データ指定（どちらか一方、または両方）
-    p.add_argument("--data_zip", type=str, default="",
-                   help="データZIPへのパス（例: /mnt/data/YOLO_SetA_seg_no1_部屋種別改変版_flat.zip）")
-    p.add_argument("--data_root", type=str, default="",
-                   help="展開済みデータのルート（空なら ZIP を展開して自動決定）")
-
-    # 走査設定
-    p.add_argument("--mask_suffix", type=str, default="_multi.png",
-                   help="マスクのファイル名サフィックス（既定: _multi.png）")
-    p.add_argument("--val_ratio", type=float, default=0.1,
-                   help="val が見つからない場合の分割比（既定: 0.1 = 9:1）")
-
-    # 学習設定
-    p.add_argument("--img_size", nargs=2, type=int, default=[512, 512],
-                   help="入力サイズ [H W]")
-    p.add_argument("--num_classes", type=int, default=23,
-                   help="クラス数（既定: 23）")
-    p.add_argument("--batch_size", type=int, default=4)
-    p.add_argument("--epochs", type=int, default=30)
-    p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--out_dir", type=str, default="runs")
-    p.add_argument("--seed", type=int, default=42)
-
-    # 推論設定
-    p.add_argument("--weights", type=str, default="runs/checkpoints/best.keras",
-                   help="学習済み重み（.keras or .h5）")
-    p.add_argument("--test_split", type=str, default="auto",
-                   choices=["auto", "train", "val"],
-                   help="推論対象分割。auto=val優先、無ければtrain")
-    p.add_argument("--save_pred", type=str, default="runs/preds",
-                   help="推論結果の保存先（PNGカラー可視化）")
-    return p.parse_args()
-
-def _ensure_data_root(args):
-    """
-    data_root が空で data_zip が与えられたら ZIP を展開し、展開先を返す。
-    data_root が指定されていればそのまま返す。
-    """
-    if args.data_root:
-        root = Path(args.data_root).resolve()
-        if not root.exists():
-            raise FileNotFoundError(f"data_root not found: {root}")
-        return str(root)
-
-    if not args.data_zip:
-        raise ValueError("データが指定されていません。--data_zip か --data_root のどちらかを指定してください。")
-
-    zip_path = Path(args.data_zip).resolve()
-    if not zip_path.exists():
-        raise FileNotFoundError(f"ZIP not found: {zip_path}")
-
-    out_base = Path(args.out_dir) / "data_extracted"
-    if out_base.exists():
-        # 既存展開物を使い回し（再現性のため残す）
-        return str(out_base.resolve())
-
-    out_base.mkdir(parents=True, exist_ok=True)
-    print(f"[Info] extracting ZIP to: {out_base}")
-    with zipfile.ZipFile(str(zip_path), "r") as zf:
-        zf.extractall(str(out_base))
-    # 展開直下に一階層フォルダがある場合はそこをルートと見なす
-    candidates = [p for p in out_base.iterdir() if p.is_dir()]
-    root = candidates[0] if len(candidates) == 1 else out_base
-    print(f"[Info] data root resolved to: {root}")
-    return str(root.resolve())
-
-def train(args):
-    set_global_seed(args.seed)
-    os.makedirs(args.out_dir, exist_ok=True)
-    ckpt_dir = Path(args.out_dir) / "checkpoints"
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-    ckpt_path = ckpt_dir / "best.keras"
-
-    data_root = _ensure_data_root(args)
-
-    # データ検出（val が無ければ自動分割）
-    train_pairs, val_pairs = discover_pairs_and_splits(
-        data_root=data_root,
-        mask_suffix=args.mask_suffix,
-        val_ratio=args.val_ratio,
-    )
-
-    # tf.data の用意
-    H, W = args.img_size
-    train_ds = make_tf_dataset(
-        pairs=train_pairs,
-        img_size=(H, W),
-        num_classes=args.num_classes,
-        batch_size=args.batch_size,
-        shuffle=True,
-        aug=True,
-    )
-    val_ds = make_tf_dataset(
-        pairs=val_pairs,
-        img_size=(H, W),
-        num_classes=args.num_classes,
-        batch_size=args.batch_size,
-        shuffle=False,
-        aug=False,
-    )
-
-    # モデル構築
-    model = build_model(input_shape=(H, W, 3), num_classes=args.num_classes)
-    opt = keras.optimizers.Adam(learning_rate=args.lr)
-    loss = keras.losses.SparseCategoricalCrossentropy(from_logits=True)
-    metrics = [MeanIoU(num_classes=args.num_classes)]
-
-    model.compile(optimizer=opt, loss=loss, metrics=metrics)
-    model.summary()
-
-    callbacks = [
-        keras.callbacks.ModelCheckpoint(
-            filepath=str(ckpt_path),
-            monitor="val_mean_iou",
-            mode="max",
-            save_best_only=True,
-            verbose=1,
-        ),
-        keras.callbacks.ReduceLROnPlateau(
-            monitor="val_loss", factor=0.5, patience=3, min_lr=1e-6, verbose=1
-        ),
-        keras.callbacks.EarlyStopping(
-            monitor="val_mean_iou", mode="max", patience=8, restore_best_weights=True, verbose=1
-        ),
-        keras.callbacks.CSVLogger(str(Path(args.out_dir) / "train_log.csv")),
-    ]
-
-    _ = model.fit(
-        train_ds,
-        validation_data=val_ds,
-        epochs=args.epochs,
-        callbacks=callbacks,
-    )
-    print("[Done] Training finished.")
-    print(f"[Best] checkpoint saved at: {ckpt_path}")
-
-def test(args):
-    import numpy as np
-    from imageio.v2 import imwrite
-
-    data_root = _ensure_data_root(args)
-    # 分割の自動解決: val優先、無ければtrain
-    if args.test_split == "auto":
-        pref = ["val", "train"]
-    else:
-        pref = [args.test_split]
-
-    # 既存の探索関数を使ってペア集合を取得
-    all_train, all_val = discover_pairs_and_splits(
-        data_root=data_root,
-        mask_suffix=args.mask_suffix,
-        val_ratio=args.val_ratio,
-        split_only=True,  # 既存フォルダ構成を保持（無いときだけ分割情報が返る）
-    )
-
-    split_pairs = None
-    for name in pref:
-        if name == "val" and all_val:
-            split_pairs = all_val; break
-        if name == "train" and all_train:
-            split_pairs = all_train; break
-    if not split_pairs:
-        raise RuntimeError("テストに使える split が見つかりません。")
-
-    H, W = args.img_size
-    print(f"[Info] loading weights: {args.weights}")
-    # ★ 推論だけなので compile=False でロード（カスタムメトリクス逆シリアライズ問題を回避）
-    model = keras.models.load_model(
-        args.weights,
-        custom_objects={"MeanIoU": MeanIoU},  # 再学習再開用に残す
-        compile=False
-    )
-
-    out_dir = Path(args.save_pred); out_dir.mkdir(parents=True, exist_ok=True)
-
-    for ip, _ in split_pairs:
-        img = read_image(ip, (H, W))  # float32 0-1, RGB
-        logits = model.predict(img[None, ...], verbose=0)[0]
-        pred = np.argmax(logits, axis=-1).astype(np.uint8)
-        rgb = colorize_index_mask(pred, args.num_classes)
-
-        stem = Path(ip).stem
-        imwrite(str(out_dir / f"{stem}_pred.png"), rgb)
-    print(f"[Done] saved predictions to: {out_dir}")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--phase", type=str, default="Train", choices=["Train", "Test"])
+    ap.add_argument("--data_root", type=str, required=True)
+    ap.add_argument("--img_size", type=int, nargs=2, default=[512, 512])
+    ap.add_argument("--num_classes", type=int, default=23)
+    ap.add_argument("--batch_size", type=int, default=4)
+    ap.add_argument("--epochs", type=int, default=30)
+    ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--out_dir", type=str, default="runs")
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--weights", type=str, default="runs/checkpoints/best.ckpt")
+    ap.add_argument("--save_pred", type=str, default="runs/preds")
+    return ap.parse_args()
 
 def main():
-    args = parse_args()
+    cfg = parse_args()
+    np.random.seed(cfg.seed)
+    tf.random.set_seed(cfg.seed)
+
     print("========== Config ==========")
-    for k, v in vars(args).items():
-        print(f"{k}: {v}")
+    print(f"phase: {cfg.phase}")
+    print(f"data_root: {cfg.data_root}")
+    print(f"img_size: {tuple(cfg.img_size)}")
+    print(f"num_classes: {cfg.num_classes}")
+    print(f"batch_size: {cfg.batch_size}")
+    print(f"epochs: {cfg.epochs}")
+    print(f"lr: {cfg.lr}")
+    print(f"out_dir: {cfg.out_dir}")
+    print(f"seed: {cfg.seed}")
+    print(f"weights: {cfg.weights}")
+    print(f"save_pred: {cfg.save_pred}")
     print("============================")
 
-    if args.phase.lower() == "train":
-        train(args)
+    if cfg.phase.lower() == "train":
+        train(cfg)
     else:
-        test(args)
+        test(cfg)
 
 if __name__ == "__main__":
     main()
