@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
 DeepFloorplan2 - net.py
-- main.py から呼び出される共通モジュール
-- *_multi.png（索引 or RGB）に対応
-- TF2/Keras の軽量U-Netを内蔵（必要に応じてここを書き換えてOK）
+- *_multi.png（索引 or RGB→索引）に対応
+- 任意構成/フラット配置データを再帰探索して <ID> と <ID>_multi.png をペアリング
+- TF2/Keras の軽量U-Netを内蔵（必要に応じて build_model を差し替えてOK）
 """
 
 import os, glob, random
@@ -23,9 +23,10 @@ def set_global_seed(seed: int = 42):
 # ========== I/O ==========
 def read_image(path, target_size):
     import cv2
-    img = cv2.imread(str(path), cv2.IMREAD_COLOR)
+    p = Path(path)
+    img = cv2.imread(str(p), cv2.IMREAD_COLOR)
     if img is None:
-        raise FileNotFoundError(f"failed to read image: {path}")
+        raise FileNotFoundError(f"failed to read image: {p}")
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     if target_size is not None:
         h, w = target_size
@@ -35,9 +36,8 @@ def read_image(path, target_size):
 
 def _rgb_to_index(rgb_mask):
     """
-    RGBマスクをユニーク色→インデックスに変換。
-    注意: 画像ごとに色→IDが異なるとクラス意味がズレるため、
-          通常は *_multi.png を単一チャネル（索引）として出力しておくのが安全。
+    RGBマスク → ユニーク色インデックス化
+    *安全策*: 本来は全データで同一定義の索引マスクを用意するのがベスト
     """
     if rgb_mask.ndim == 2:
         return rgb_mask
@@ -50,10 +50,10 @@ def _rgb_to_index(rgb_mask):
 
 def read_mask(path, target_size, num_classes=None):
     import cv2
-    m = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+    p = Path(path)
+    m = cv2.imread(str(p), cv2.IMREAD_UNCHANGED)
     if m is None:
-        raise FileNotFoundError(f"failed to read mask: {path}")
-    # 1ch 索引か、3ch RGB のいずれかを想定
+        raise FileNotFoundError(f"failed to read mask: {p}")
     if m.ndim == 3:
         m = cv2.cvtColor(m, cv2.COLOR_BGR2RGB)
         m = _rgb_to_index(m)
@@ -65,40 +65,129 @@ def read_mask(path, target_size, num_classes=None):
         m = np.clip(m, 0, num_classes - 1)
     return m
 
-def pair_image_mask_lists(images_dir, labels_dir, mask_suffix="_multi.png"):
-    images_dir = Path(images_dir)
-    labels_dir = Path(labels_dir)
-    img_paths = sorted([p for p in images_dir.glob("*.*") if p.suffix.lower() in [".png", ".jpg", ".jpeg"]])
+# ========== データ探索 ==========
+_IMG_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
+
+def _rglob_files(root: Path, exts):
+    files = []
+    for p in root.rglob("*"):
+        if p.is_file() and p.suffix.lower() in exts:
+            files.append(p)
+    return files
+
+def pair_image_mask_lists_generic(root: Path, mask_suffix: str = "_multi.png"):
+    """
+    再帰的に画像と <stem> + mask_suffix を探索し、(image, mask) のリストを返す
+    - 画像: *_IMG_EXTS
+    - マスク: 同一stem + mask_suffix（場所はどこでもOK、優先は同ディレクトリ→labels/masks ディレクトリ）
+    """
+    root = Path(root)
+    img_files = _rglob_files(root, _IMG_EXTS)
+    # マスク候補の高速ルックアップ用
+    #  stem -> [absolute paths of candidates]
+    mask_map = {}
+    for p in root.rglob(f"*{mask_suffix}"):
+        if p.is_file():
+            mask_map.setdefault(p.stem.replace(mask_suffix.replace(".png", ""), ""), []).append(p)
+
     pairs = []
-    for ip in img_paths:
+    for ip in sorted(img_files):
         stem = ip.stem
-        mp = labels_dir / f"{stem}{mask_suffix}"
-        if mp.exists():
-            pairs.append((str(ip), str(mp)))
+        # 優先度: 同ディレクトリ /labels /masks をざっくり担保（候補が複数なら距離が近い順）
+        cands = mask_map.get(stem, [])
+        if not cands:
+            # 例: 画像が a/b/c/xxx.jpg のとき、xxx_multi.png を近隣に探すフォールバック
+            local = list(ip.parent.glob(f"{stem}{mask_suffix}"))
+            if local:
+                cands = local
+        if cands:
+            # 近いパスを優先
+            cands_sorted = sorted(cands, key=lambda p: len(os.path.relpath(str(p), start=str(ip.parent))))
+            pairs.append((str(ip), str(cands_sorted[0])))
     return pairs
 
-def discover_splits(data_root: str):
-    data_root = Path(data_root)
-    tr_img = data_root / "train" / "images"
-    tr_lab = data_root / "train" / "labels"
-    va_img = data_root / "val" / "images"
-    va_lab = data_root / "val" / "labels"
+def _has_yolo_layout(root: Path):
+    return (root / "train" / "images").exists() and (root / "train" / "labels").exists()
 
-    train_pairs = pair_image_mask_lists(tr_img, tr_lab)
-    val_pairs = pair_image_mask_lists(va_img, va_lab) if va_img.exists() else []
+def _pair_yolo_like(root: Path, mask_suffix: str):
+    tr = (root / "train" / "images", root / "train" / "labels")
+    va = (root / "val" / "images", root / "val" / "labels")
+    def pair_in(img_dir, lab_dir):
+        img_paths = sorted([p for p in Path(img_dir).glob("*.*") if p.suffix.lower() in _IMG_EXTS])
+        pairs = []
+        for ip in img_paths:
+            mp = Path(lab_dir) / f"{ip.stem}{mask_suffix}"
+            if mp.exists():
+                pairs.append((str(ip), str(mp)))
+        return pairs
+    train_pairs = pair_in(*tr)
+    val_pairs = pair_in(*va) if (root / "val").exists() else []
+    return train_pairs, val_pairs
 
-    if not train_pairs:
-        raise RuntimeError(f"No train pairs found under {tr_img} / {tr_lab}")
+def discover_pairs_and_splits(data_root: str, mask_suffix: str = "_multi.png",
+                              val_ratio: float = 0.1, split_only: bool = False):
+    """
+    data_root 直下が YOLOライク（train/images, train/labels, val/...）ならそれを採用。
+    そうでなければ、全体を再帰探索してペア集合を作り、val が存在しない場合は val_ratio で分割する。
+    split_only=True の場合、既存の構成を尊重（val が見つからねば train 全体のみ返す）。
+    """
+    root = Path(data_root)
+    if not root.exists():
+        raise FileNotFoundError(f"data_root not found: {root}")
 
-    if not val_pairs:
-        # 9:1 分割（先頭を val）
-        n = len(train_pairs)
-        k = max(1, int(n * 0.1))
-        val_pairs = train_pairs[:k]
-        train_pairs = train_pairs[k:]
-        print(f"[Info] val split not found -> use split: train={len(train_pairs)} val={len(val_pairs)}")
-    else:
-        print(f"[Info] discovered: train={len(train_pairs)} val={len(val_pairs)}")
+    if _has_yolo_layout(root):
+        train_pairs, val_pairs = _pair_yolo_like(root, mask_suffix)
+        if not train_pairs:
+            raise RuntimeError(f"No train pairs found under YOLO-like layout: {root}")
+        if not val_pairs and not split_only:
+            # val が無ければ分割
+            n = len(train_pairs)
+            k = max(1, int(n * val_ratio))
+            val_pairs = train_pairs[:k]
+            train_pairs = train_pairs[k:]
+            print(f"[Info] YOLO-like but no val -> split: train={len(train_pairs)} val={len(val_pairs)}")
+        else:
+            print(f"[Info] YOLO-like discovered: train={len(train_pairs)} val={len(val_pairs)}")
+        return train_pairs, val_pairs
+
+    # 汎用フラット/任意構成
+    all_pairs = pair_image_mask_lists_generic(root, mask_suffix=mask_suffix)
+    if not all_pairs:
+        raise RuntimeError(f"No (image, mask) pairs found in: {root} with suffix={mask_suffix}")
+
+    # train/val サブフォルダがあるかを簡易判定
+    train_hint = [p for p in (root / "train").rglob("*") if p.is_file()] if (root / "train").exists() else []
+    val_hint   = [p for p in (root / "val").rglob("*")   if p.is_file()] if (root / "val").exists() else []
+
+    if train_hint or val_hint:
+        # サブフォルダヒントに基づく割当（各ペアの画像パスが train/ または val/ を含むか）
+        train_pairs = [(ip, mp) for ip, mp in all_pairs if "/train/" in Path(ip).as_posix()]
+        val_pairs   = [(ip, mp) for ip, mp in all_pairs if "/val/"   in Path(ip).as_posix()]
+        if not val_pairs and not split_only:
+            # val 無ければ分割
+            rest = [(ip, mp) for ip, mp in all_pairs if "/train/" in Path(ip).as_posix() or "/val/" in Path(ip).as_posix()]
+            base = train_pairs if train_pairs else rest
+            if not base:
+                base = all_pairs
+            n = len(base)
+            k = max(1, int(n * val_ratio))
+            val_pairs = base[:k]
+            train_pairs = base[k:]
+            print(f"[Info] flat train/val hint -> split: train={len(train_pairs)} val={len(val_pairs)}")
+        else:
+            print(f"[Info] flat hint discovered: train={len(train_pairs)} val={len(val_pairs)}")
+        return train_pairs, val_pairs
+
+    # 完全フラット（train/val すら無い）: 分割 or split_only
+    if split_only:
+        # 既存分割は無いので train 全体のみ返す
+        print(f"[Info] split_only: returning all as train, none as val (flat dataset)")
+        return all_pairs, []
+    n = len(all_pairs)
+    k = max(1, int(n * val_ratio))
+    val_pairs = all_pairs[:k]
+    train_pairs = all_pairs[k:]
+    print(f"[Info] flat split -> train={len(train_pairs)} val={len(val_pairs)}  (total={n})")
     return train_pairs, val_pairs
 
 # ========== tf.data ==========
@@ -117,7 +206,7 @@ def make_tf_dataset(pairs, img_size, num_classes, batch_size, shuffle, aug=False
         img.set_shape([H, W, 3])
         msk.set_shape([H, W])
         if aug:
-            # 左右/上下フリップのみ（元図面の幾何学一貫性を壊しにくい簡易Aug）
+            # 幾何を壊しにくい簡易Aug
             if tf.random.uniform([]) > 0.5:
                 img = tf.image.flip_left_right(img)
                 msk = tf.image.flip_left_right(msk[..., None])[..., 0]
@@ -159,7 +248,7 @@ def _up(x, skip, filters):
 def build_model(input_shape, num_classes):
     """
     既定: 軽量U-Net
-    - 必要ならここを既存のバックボーンに差し替え可
+    - ここを既存バックボーンや別モデルに差し替えてもOK
     """
     inputs = layers.Input(shape=input_shape)
     c1, p1 = _down(inputs, 32)
@@ -173,14 +262,14 @@ def build_model(input_shape, num_classes):
     u3 = _up(u2, c2, 64)
     u4 = _up(u3, c1, 32)
 
-    logits = layers.Conv2D(num_classes, 1, padding="same", name="logits")(u4)  # from_logits=True 前提
+    logits = layers.Conv2D(num_classes, 1, padding="same", name="logits")(u4)  # from_logits=True
     model = keras.Model(inputs, logits, name="UNetLite")
     return model
 
 # ========== メトリクス ==========
 class MeanIoU(tf.keras.metrics.Metric):
     """
-    Keras MeanIoU を logits + sparse label で扱いやすくするラッパ
+    Keras MeanIoU を logits + sparse label で扱うラッパ
     """
     def __init__(self, num_classes, name="mean_iou", **kwargs):
         super().__init__(name=name, **kwargs)
