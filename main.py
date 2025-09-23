@@ -1,19 +1,34 @@
 # -*- coding: utf-8 -*-
 """
-TF2/Keras3 版 DeepFloorplan 互換ドライバ
-- zlzeng/DeepFloorplan の main.py のオプション構成に合わせた CLI
-- Train / Test フェーズ両対応
-- データ構成（例）:
-    data_root/
-      images/               ... 入力画像 (.jpg/.png)
-      masks/                ... 教師ラベル（multi ラベル or 個別ラベル）
-         *_cw.png           ... 0/1 の境界ラベル（任意）
-         *_room.png         ... 0..C-1 の部屋種別ラベル
-         *_multi.png        ... まとめラベル（r を主で利用）
-    もしくは YOLO-like:
-      train/images, train/labels (未使用)
-      val/images, val/labels     (推論可)
-- Test は画像だけあれば OK（room ヘッドの argmax を出力）
+TF2/Keras3 版 DeepFloorplan ドライバ（データ構成を自動検出）
+対応するディレクトリ例：
+  [A] r3d_index 方式：
+      data_root/
+        r3d_train.txt
+        r3d_val.txt     (任意)
+        r3d_test.txt    (任意)
+      - 行形式:
+          img_path, room_mask_path[, cw_mask_path]
+        もしくは空白区切り、相対パス可（data_root 起点）
+
+  [B] YOLO/flat 方式：
+      data_root/
+        train/images/*.jpg|png
+        train/masks/*.png              (任意)
+        train/labels/*.png             (任意)
+        images/*.jpg|png               (任意)
+        masks/*.png                    (任意)
+      - ラベル解決規則:
+         <stem><mask_suffix> を最優先（例: 1000001_multi.png）
+         次候補: <stem>_room.png / <stem>.png なども探索
+
+CLI 例:
+  Train:
+    !python main.py --phase Train --data_root /content/YOLO_SetA_seg_no1_部屋種別改変版_flat \
+      --img_size 512 512 --num_classes 23 --mask_suffix _multi.png \
+      --weights runs/checkpoints/best.ckpt
+  Test:
+    !python main.py --phase Test --data_root /content/... --weights runs/checkpoints/best.ckpt
 """
 
 from __future__ import annotations
@@ -31,42 +46,103 @@ from net import build_network
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"  # INFO/WARN 抑制
 
-# -------------------------
-# ユーティリティ
-# -------------------------
-
 IMG_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")
 
-def _list_images(root: str) -> List[str]:
+# -------------------------
+# パスユーティリティ
+# -------------------------
+
+def _ensure_dir(p: str):
+    Path(p).mkdir(parents=True, exist_ok=True)
+
+def _is_image(p: str) -> bool:
+    return p.lower().endswith(IMG_EXTS)
+
+def _read_index_file(idx_path: str) -> List[List[str]]:
+    lines = []
+    with open(idx_path, "r", encoding="utf-8") as f:
+        for raw in f:
+            s = raw.strip()
+            if not s or s.startswith("#"):
+                continue
+            # カンマ優先、次に空白
+            if "," in s:
+                cols = [c.strip() for c in s.split(",")]
+            else:
+                cols = s.split()
+            if len(cols) < 2:
+                continue
+            lines.append(cols)
+    return lines
+
+def _resolve_rel(p: str, root: str) -> str:
+    q = Path(p)
+    if not q.is_absolute():
+        q = Path(root) / q
+    return str(q)
+
+def _list_images_candidates(root: str) -> List[str]:
+    # YOLO/flat の代表的場所を総当たりで探索
     pats = [
-        f"{root}/images/*",
         f"{root}/train/images/*",
+        f"{root}/images/*",
         f"{root}/val/images/*",
-        f"{root}/*",  # 直下置き
+        f"{root}/test/images/*",
+        f"{root}/*",
     ]
     files = []
     for p in pats:
-        files.extend([f for f in glob(p) if f.lower().endswith(IMG_EXTS)])
+        files.extend([f for f in glob(p) if _is_image(f)])
     return sorted(set(files))
 
-def _match_label_path(img_path: str, lbl_root: str, suffix: str) -> Optional[str]:
+def _label_search_dirs(img_path: str) -> List[str]:
+    # 画像と同階層 / 親階層の masks / labels / annotations も探索
+    img_dir = Path(img_path).parent
+    dirs = [
+        img_dir,
+        img_dir / "masks",
+        img_dir / "labels",
+        img_dir.parent / "masks",
+        img_dir.parent / "labels",
+        img_dir.parent / "annotations",
+        img_dir.parent,  # 親直下
+    ]
+    uniq = []
+    for d in dirs:
+        d = str(d)
+        if d not in uniq:
+            uniq.append(d)
+    return uniq
+
+def _find_label_for_image(img_path: str,
+                          mask_suffix: str,
+                          fallback_suffixes: List[str]) -> Optional[str]:
     """
-    画像ファイル名に対応するラベルを推定:
-      - <stem>_<suffix>.png
-      - <stem>.png （suffix 無し）
+    優先順：
+      1) <stem><mask_suffix>（例: _multi.png）
+      2) fallback_suffixes（例: _room.png, .png, _rooms.png など）
+    検索場所：画像と同階層 → masks → labels → 親/masks → 親/labels → 親直下
     """
     stem = Path(img_path).stem
-    cands = [
-        os.path.join(lbl_root, f"{stem}_{suffix}.png"),
-        os.path.join(lbl_root, f"{stem}.png"),
-    ]
-    for c in cands:
-        if os.path.isfile(c):
-            return c
+    search_dirs = _label_search_dirs(img_path)
+
+    # 1) 明示 mask_suffix
+    cand_names = [f"{stem}{mask_suffix}"] if mask_suffix else []
+    # 2) フォールバック
+    cand_names += [f"{stem}{suf}" for suf in fallback_suffixes]
+
+    for d in search_dirs:
+        for name in cand_names:
+            c = str(Path(d) / name)
+            if os.path.isfile(c):
+                return c
     return None
 
+# -------------------------
+# 画像 / ラベル読み込み
+# -------------------------
+
 def _load_image(path: str, img_size: Tuple[int, int]) -> np.ndarray:
-    """HWC, float32[0,1], RGB"""
     data = tf.io.read_file(path)
     img  = tf.image.decode_image(data, channels=3, expand_animations=False)
     img  = tf.image.resize(img, img_size, method="bilinear")
@@ -74,53 +150,111 @@ def _load_image(path: str, img_size: Tuple[int, int]) -> np.ndarray:
     return img.numpy()
 
 def _load_label(path: str, img_size: Tuple[int, int]) -> np.ndarray:
-    """HW int32"""
     data = tf.io.read_file(path)
     lab  = tf.image.decode_image(data, channels=1, expand_animations=False)
     lab  = tf.image.resize(lab, img_size, method="nearest")
     lab  = tf.squeeze(tf.cast(lab, tf.int32), axis=-1)
     return lab.numpy()
 
-def _ensure_dir(p: str):
-    Path(p).mkdir(parents=True, exist_ok=True)
-
 # -------------------------
-# データセット
+# データセット構築（Train）
 # -------------------------
 
 def make_dataset_train(data_root: str,
                        img_size: Tuple[int, int],
                        num_room_classes: int,
-                       cw_suffix: str = "cw",
-                       room_suffix: str = "room",
-                       multi_suffix: str = "multi",
+                       mask_suffix: str = "_multi.png",
+                       cw_suffix_hint: Optional[str] = None,
                        batch_size: int = 4,
                        shuffle: bool = True):
     """
-    学習用: cw と room の教師を探す
-    - masks/ に *_cw.png と *_room.png があれば優先
-    - *_multi.png のみの場合、room を multi から読み込む（cw は未使用/ゼロ）
+    優先: r3d_train.txt を使う
+      - 2列:   img, room
+      - 3列:   img, room, cw  または img, cw, room（自動判別）
+    次点: 画像を列挙して <stem><mask_suffix> を探す（無ければ _room.png などを試す）
     """
-    img_files = _list_images(data_root)
-    masks_dir = os.path.join(data_root, "masks")
+    root = data_root
+    idx_path = Path(root) / "r3d_train.txt"
     pairs = []
 
-    for img in img_files:
-        room_lbl = _match_label_path(img, masks_dir, room_suffix)
-        cw_lbl   = _match_label_path(img, masks_dir, cw_suffix)
-        multi    = _match_label_path(img, masks_dir, multi_suffix)
+    if idx_path.is_file():
+        rows = _read_index_file(str(idx_path))
+        print(f"[Train] r3d index found: {idx_path} (rows={len(rows)})")
+        for cols in rows:
+            # 2列 or 3列に対応
+            if len(cols) == 2:
+                img_p, room_p = cols[0], cols[1]
+                cw_p = None
+            else:
+                # 3列は room/cw の順が不定なので推測
+                a, b, c = cols[0], cols[1], cols[2]
+                # img は画像拡張子を含むはず
+                img_p = a
+                # b, c のうち「room らしい方」を room とみなす（_room / _multi / rooms を優先）
+                if any(x in b.lower() for x in ["_room", "room", "multi", "rooms"]):
+                    room_p, cw_p = b, c
+                elif any(x in c.lower() for x in ["_room", "room", "multi", "rooms"]):
+                    room_p, cw_p = c, b
+                else:
+                    # よく分からない場合は b=room, c=cw と仮定
+                    room_p, cw_p = b, c
 
-        if room_lbl is None and multi is not None:
-            room_lbl = multi
+            img_abs  = _resolve_rel(img_p, root)
+            room_abs = _resolve_rel(room_p, root)
+            cw_abs   = _resolve_rel(cw_p, root) if cw_p else None
 
-        if room_lbl is None:
-            # 学習用は room ラベル必須
-            continue
+            if not os.path.isfile(img_abs):
+                print(f"[Warn] image not found: {img_abs} -> skip")
+                continue
+            if not os.path.isfile(room_abs):
+                print(f"[Warn] room label not found: {room_abs} -> skip")
+                continue
+            if cw_abs and (not os.path.isfile(cw_abs)):
+                print(f"[Warn] cw label not found: {cw_abs} -> ignore cw")
+                cw_abs = None
 
-        pairs.append((img, cw_lbl, room_lbl))
+            pairs.append((img_abs, cw_abs, room_abs))
+
+    else:
+        # 画像列挙してラベルを自動発見
+        imgs = _list_images_candidates(root)
+        print(f"[Train] images discovered: {len(imgs)}")
+        if len(imgs) == 0:
+            raise RuntimeError("学習用の画像が見つかりませんでした。data_root 配下をご確認ください。")
+
+        # フォールバック候補（順序重要）
+        fb = []
+        if mask_suffix and mask_suffix != "_multi.png":
+            fb.append("_multi.png")
+        fb += ["_room.png", "_rooms.png", ".png"]  # 例: 1000001.png（部屋ラベルのみ）
+
+        for img in imgs:
+            room_lbl = _find_label_for_image(img, mask_suffix=mask_suffix, fallback_suffixes=fb)
+            if room_lbl is None:
+                # 見つからない場合はスキップ（学習用は room 必須）
+                continue
+
+            # cw は任意。ヒントがあれば同様に探索
+            cw_lbl = None
+            cw_candidates = []
+            if cw_suffix_hint:  # 例: "_cw.png" や "_close_wall.png"
+                cw_candidates.append(cw_suffix_hint)
+            cw_candidates += ["_cw.png", "_closewall.png", "_close_wall.png", "_boundary.png"]
+            for suf in cw_candidates:
+                cw_try = _find_label_for_image(img, mask_suffix=suf, fallback_suffixes=[])
+                if cw_try is not None:
+                    cw_lbl = cw_try
+                    break
+
+            pairs.append((img, cw_lbl, room_lbl))
 
     if len(pairs) == 0:
-        raise RuntimeError("学習用の (画像, roomラベル) が見つかりませんでした。masks ディレクトリをご確認ください。")
+        raise RuntimeError("学習用の (画像, roomラベル) が見つかりませんでした。アップロード構成（r3d_train.txt / *_multi.png など）をご確認ください。")
+
+    print(f"[Train] usable pairs: {len(pairs)}")
+    # 先頭数件を表示
+    for i in range(min(5, len(pairs))):
+        print(f"  [sample#{i+1}] img={pairs[i][0]}\n               room={pairs[i][2]}\n               cw={pairs[i][1]}")
 
     def _gen():
         for img, cw_lbl, room_lbl in pairs:
@@ -130,7 +264,6 @@ def make_dataset_train(data_root: str,
                 cw_np = _load_label(cw_lbl, img_size)
             else:
                 cw_np = np.zeros_like(room_np, dtype=np.int32)
-
             yield img_np, cw_np, room_np
 
     ds = tf.data.Dataset.from_generator(
@@ -146,12 +279,44 @@ def make_dataset_train(data_root: str,
     ds = ds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
     return ds, len(pairs)
 
+# -------------------------
+# データセット構築（Test）
+# -------------------------
+
 def make_dataset_test(data_root: str,
                       img_size: Tuple[int, int],
                       batch_size: int = 1):
-    img_files = _list_images(data_root)
+    root = data_root
+    # r3d_test.txt / r3d_val.txt があれば、それらの1列目（画像）を読み込む
+    idx_test = Path(root) / "r3d_test.txt"
+    idx_val  = Path(root) / "r3d_val.txt"
+
+    img_files = []
+    picked_idx = None
+    if idx_test.is_file():
+        rows = _read_index_file(str(idx_test))
+        picked_idx = idx_test
+        for cols in rows:
+            if len(cols) == 0:
+                continue
+            img_files.append(_resolve_rel(cols[0], root))
+    elif idx_val.is_file():
+        rows = _read_index_file(str(idx_val))
+        picked_idx = idx_val
+        for cols in rows:
+            if len(cols) == 0:
+                continue
+            img_files.append(_resolve_rel(cols[0], root))
+    else:
+        img_files = _list_images_candidates(root)
+
+    img_files = [p for p in img_files if os.path.isfile(p)]
     if len(img_files) == 0:
-        raise RuntimeError("推論対象の画像が見つかりませんでした。data_root 配下の images/ などをご確認ください。")
+        raise RuntimeError("推論対象の画像が見つかりませんでした。data_root 配下をご確認ください。")
+    if picked_idx:
+        print(f"[Test] index used: {picked_idx} (images={len(img_files)})")
+    else:
+        print(f"[Test] images discovered: {len(img_files)})")
 
     def _gen():
         for p in img_files:
@@ -168,7 +333,7 @@ def make_dataset_test(data_root: str,
     return ds, img_files
 
 # -------------------------
-# ループ
+# 学習 / 推論ループ
 # -------------------------
 
 @tf.function(jit_compile=False)
@@ -182,13 +347,14 @@ def _train_step(model, optimizer, images, labels_cw, labels_r):
 
 def train(cfg):
     img_h, img_w = cfg.img_size
-    ds, n_samples = make_dataset_train(cfg.data_root, (img_h, img_w),
-                                       num_room_classes=cfg.num_classes,
-                                       cw_suffix="close_wall",  # 既定名例: *_close_wall.png
-                                       room_suffix="room",
-                                       multi_suffix="multi",
-                                       batch_size=cfg.batch_size,
-                                       shuffle=True)
+    ds, n_samples = make_dataset_train(
+        cfg.data_root, (img_h, img_w),
+        num_room_classes=cfg.num_classes,
+        mask_suffix=cfg.mask_suffix,
+        cw_suffix_hint=cfg.cw_suffix_hint,
+        batch_size=cfg.batch_size,
+        shuffle=True
+    )
     steps_per_epoch = max(1, n_samples // cfg.batch_size)
 
     model = build_network(img_size=(img_h, img_w),
@@ -196,12 +362,10 @@ def train(cfg):
                           num_cw_classes=2)
     optimizer = optimizers.Adam(learning_rate=cfg.lr)
 
-    # チェックポイント
     _ensure_dir(os.path.dirname(cfg.weights))
     ckpt = tf.train.Checkpoint(model=model, optimizer=optimizer)
     ckpt_mgr = tf.train.CheckpointManager(ckpt, directory=os.path.dirname(cfg.weights), max_to_keep=3)
 
-    # 既存読み込み
     if os.path.isfile(cfg.weights):
         try:
             ckpt.restore(cfg.weights)
@@ -217,13 +381,10 @@ def train(cfg):
             for k in hist.keys():
                 hist[k].append(float(losses[k].numpy()))
 
-        # ログ
         log = ", ".join([f"{k}={np.mean(v):.4f}" for k, v in hist.items()])
         print(f"[Train][ep={ep+1}/{cfg.epochs}] {log}")
 
-        # save
         save_path = ckpt_mgr.save()
-        # 互換のため .keras も保存（デプロイ簡便化）
         try:
             model.save(cfg.weights.replace(".ckpt", ".keras"))
         except Exception:
@@ -238,7 +399,6 @@ def test(cfg):
                           num_room_classes=cfg.num_classes,
                           num_cw_classes=2)
 
-    # 重みロード: .ckpt 優先、失敗したら .keras
     loaded = False
     if os.path.isfile(cfg.weights):
         try:
@@ -250,7 +410,6 @@ def test(cfg):
     keras_path = cfg.weights if cfg.weights.endswith(".keras") else cfg.weights + ".keras"
     if (not loaded) and os.path.isfile(keras_path):
         try:
-            # Keras の save/load 互換保持のために別 Model をロードして重みコピー
             m2 = tf.keras.models.load_model(keras_path, compile=False)
             for w_src, w_dst in zip(m2.weights, model.weights):
                 w_dst.assign(w_src)
@@ -266,8 +425,7 @@ def test(cfg):
 
     for images, pth in ds:
         logits_cw, logits_r = model(images, training=False)
-        pred_r = tf.argmax(logits_r, axis=-1)[0].numpy().astype(np.uint8)  # HW
-        # 保存
+        pred_r = tf.argmax(logits_r, axis=-1)[0].numpy().astype(np.uint8)
         stem = Path(bytes(pth.numpy()[0]).decode()).stem
         out_path = os.path.join(cfg.save_pred, f"{stem}_room_pred.png")
         tf.keras.utils.save_img(out_path, pred_r, scale=False)
@@ -290,6 +448,12 @@ def parse_args():
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--weights", type=str, default="runs/checkpoints/best.ckpt")
     ap.add_argument("--save_pred", type=str, default="runs/preds")
+
+    # 追加：アップロード構成に合わせるための可変パラメータ
+    ap.add_argument("--mask_suffix", type=str, default="_multi.png",
+                    help="部屋ラベルのサフィックス（例: _multi.png, _room.png）")
+    ap.add_argument("--cw_suffix_hint", type=str, default=None,
+                    help="境界ラベルのサフィックスヒント（例: _cw.png, _close_wall.png）")
     return ap.parse_args()
 
 def main():
@@ -309,6 +473,8 @@ def main():
     print(f"seed: {cfg.seed}")
     print(f"weights: {cfg.weights}")
     print(f"save_pred: {cfg.save_pred}")
+    print(f"mask_suffix: {cfg.mask_suffix}")
+    print(f"cw_suffix_hint: {cfg.cw_suffix_hint}")
     print("============================")
 
     if cfg.phase.lower() == "train":
